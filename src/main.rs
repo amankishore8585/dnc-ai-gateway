@@ -18,6 +18,13 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpStream, TcpListener};
 use tokio::time::{timeout, Duration};
+use tokio::io::{AsyncRead, AsyncWrite};
+
+use tokio_native_tls::TlsConnector;
+use native_tls::TlsConnector as NativeTlsConnector;
+
+trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 const DEBUG: bool = false;
 
@@ -239,11 +246,16 @@ async fn handle_client(
     let upstream_addr = {
         let mut map = balancers.lock().unwrap();
 
-        if let Some(lb) = map.get_mut(&req.path) {
-            lb.next()
-        } else {
-            None
+        let mut selected = None;
+
+        for (route, lb) in map.iter_mut() {
+            if req.path.starts_with(route) {
+                selected = lb.next();
+                break;
+            }
         }
+
+        selected
     };
 
     let upstream_addr = match upstream_addr {
@@ -260,50 +272,58 @@ async fn handle_client(
     }
 
     // connect to backend with timeout
-    let mut upstream = match timeout(
-        Duration::from_secs(3),
-        TcpStream::connect(upstream_addr.clone())
-    ).await {
-        Ok(Ok(stream)) => stream,
+    let mut upstream: Box<dyn IoStream> =
+        if upstream_addr.ends_with(":443") {
 
-        Ok(Err(e)) => {
-            eprintln!("Failed to connect to backend {}: {}", upstream_addr, e);
+            let host = upstream_addr.split(':').next().unwrap_or("");
 
-            
-            // mark backend unhealthy
-            {
-                let mut map = balancers.lock().unwrap();
-
-                if let Some(lb) = map.get_mut(&req.path) {
-                    lb.mark_unhealthy(&upstream_addr);
+            let stream = match timeout(
+                Duration::from_secs(3),
+                TcpStream::connect(upstream_addr.clone())
+            ).await {
+                Ok(Ok(s)) => s,
+                _ => {
+                    client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await.ok();
+                    return;
                 }
-            }
-            
-            let response =
-                b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n";
+            };
 
-            client.write_all(response).await.ok();
-            return;
-        }
+            let cx = NativeTlsConnector::builder().build().unwrap();
+            let cx = TlsConnector::from(cx);
 
-        Err(_) => {
-            eprintln!("Upstream connection timeout {}", upstream_addr);
-
-            {
-                let mut map = balancers.lock().unwrap();
-
-                if let Some(lb) = map.get_mut(&req.path) {
-                    lb.mark_unhealthy(&upstream_addr);
+            match cx.connect(host, stream).await {
+                Ok(tls_stream) => Box::new(tls_stream),
+                Err(_) => {
+                    client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await.ok();
+                    return;
                 }
             }
 
-            let response =
-                b"HTTP/1.1 504 Gateway Timeout\r\nContent-Length: 0\r\n\r\n";
+        } else {
 
-            client.write_all(response).await.ok();
-            return;
-        }
-    };
+            match timeout(
+                Duration::from_secs(3),
+                TcpStream::connect(upstream_addr.clone())
+            ).await {
+                Ok(Ok(stream)) => Box::new(stream),
+                _ => {
+
+                    {
+                        let mut map = balancers.lock().unwrap();
+
+                        for (route, lb) in map.iter_mut() {
+                            if req.path.starts_with(route) {
+                                lb.mark_unhealthy(&upstream_addr);
+                                break;
+                            }
+                        }
+                    }
+
+                    client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await.ok();
+                    return;
+                    }
+                }
+            };
 
     // forward request line
     let request_line = format!("{} {} {}\r\n", req.method, req.path, req.version);
@@ -419,6 +439,13 @@ async fn main() {
             "/local".to_string(),
             LoadBalancer::new(vec![
                 "127.0.0.1:9001".to_string(),
+            ]),
+        );
+
+        map.insert(
+            "/v1".to_string(),
+            LoadBalancer::new(vec![
+                "api.openai.com:443".to_string(),
             ]),
         );
     }
