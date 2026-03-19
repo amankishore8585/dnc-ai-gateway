@@ -66,75 +66,76 @@ http://127.0.0.1:8080
 curl -i http://127.0.0.1:8080/test
 ```
 
-  Expected:
+Expected:
 
-  - HTTP 401 Unauthorized
+- HTTP 401 Unauthorized
 
-  - Response includes X-Request-ID
+- Response includes X-Request-ID
 
-  - Logs show missing_api_key
+- Logs show missing_api_key
 
 
 2. Invalid API Key (should return 403)
-  ```bash  
-    curl -i -H "X-API-Key: wrong_key" http://127.0.0.1:8080/test
-  ```
+```bash  
+  curl -i -H "X-API-Key: wrong_key" http://127.0.0.1:8080/test
+```
 
-  Expected:
+Expected:
 
-  - HTTP 403 Forbidden
+- HTTP 403 Forbidden
 
-  - Logs show invalid_api_key    
+- Logs show invalid_api_key    
 
 
 3. Valid API Key (should succeed)
-  ```bash  
-    curl -i -H "X-API-Key: user1" http://127.0.0.1:8080/test
-  ```
+```bash  
+  curl -i -H "X-API-Key: user1" http://127.0.0.1:8080/test
+```
 
-  Expected:
+Expected:
 
-  - HTTP 200 OK or Error 502 cause it expects server to run in background.  run a simple server in another 2 other terminals 
-  ```bash  
-  python3 -m http.server 9002
-  ```    
-  ```
-  python3 -m http.server 9003
-  ```
-  Now retry
+- HTTP 200 OK or Error 502 cause it expects server to run in background.  run a simple server in another 2 other terminals 
+```bash  
+python3 -m http.server 9002
+```    
+```
+python3 -m http.server 9003
+```
+Now retry
 
-  - Request is routed to backend
+- Request is routed to backend
 
 
 4. Rate Limiting (should return 429)
 
-  ```bash
-    for i in {1..10}; do
-      curl -s -o /dev/null -w "%{http_code}\n" \
-      -H "X-API-Key: user1" http://127.0.0.1:8080/test
-    done
-  ```
+```bash
+  for i in {1..10}; do
+    curl -s -o /dev/null -w "%{http_code}\n" \
+    -H "X-API-Key: user1" http://127.0.0.1:8080/test
+  done
+```
 
-  Expected:
+Expected:
 
-  - Some requests return 429 Too Many Requests 
-    (might need to start local backend at - python3 -m http.server 9002)
+- Some requests return 429 Too Many Requests 
+  (might need to start local backend at - python3 -m http.server 9002)
 
-  - Logs show rate_limited    
+- Logs show rate_limited    
+
 
 5. OpenAI request through gateway:
-  ```bash
-    curl -i http://127.0.0.1:8080/v1/models \
-    -H "Authorization: Bearer YOUR_OPENAI_API_KEY" \
-    -H "X-API-Key: user1"
-  ```
-  (put your api key after Bearer-sjk***************")
+```bash
+  curl -i http://127.0.0.1:8080/v1/models \
+  -H "Authorization: Bearer YOUR_OPENAI_API_KEY" \
+  -H "X-API-Key: user1"
+```
+(put your api key after Bearer-sjk***************")
   
-  Expected:
+Expected:
 
-  - It shows a list of all modes in json format.Meaning its working properly.
+- It shows a list of all modes in json format.Meaning its working properly.
 
-  - It might show error due to wrong api key. And you can see the error in ur logs. 
+- It might show error due to wrong api key. And you can see the error in ur logs. 
 
 6. Check metrics
 
@@ -142,9 +143,9 @@ curl -i http://127.0.0.1:8080/test
 curl http://127.0.0.1:8080/metrics
 ```
 
-  Expected:
+Expected:
 
-  - List of metrics -total req,failures,rate limited and successful req
+- List of metrics -total req,failures,rate limited and successful req
 
 
 ## Architecture
