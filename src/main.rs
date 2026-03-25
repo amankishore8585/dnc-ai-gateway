@@ -445,6 +445,14 @@ async fn handle_client(
     upstream.write_all(&modified).await.unwrap();
     upstream.flush().await.unwrap();
 
+    // 🔥 send any body bytes that were already read
+    let header_end = buffer.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+
+    if buffer.len() > header_end {
+        let already_read_body = &buffer[header_end..];
+        upstream.write_all(already_read_body).await.unwrap();
+    }
+
     match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
         Ok((_from_client, _from_upstream)) => {
             upstream_status_code = 200;
