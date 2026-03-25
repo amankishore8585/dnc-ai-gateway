@@ -413,17 +413,24 @@ async fn handle_client(
     // ---- find end of headers ----
     if let Some(headers_end) = modified.windows(4).position(|w| w == b"\r\n\r\n") {
 
-        // split headers and body
         let (headers, _body) = modified.split_at(headers_end + 4);
-
-        let headers_str = String::from_utf8_lossy(headers);
 
         let host = upstream_addr.split(':').next().unwrap_or("");
 
-        // rebuild headers with correct Host
         let mut new_headers = Vec::new();
 
+        // split correctly by CRLF
         for line in headers.split(|&b| b == b'\n') {
+            let line = if line.ends_with(b"\r") {
+                &line[..line.len() - 1] // remove trailing \r
+            } else {
+                line
+            };
+
+            if line.is_empty() {
+                continue;
+            }
+
             if line.starts_with(b"Host:") || line.starts_with(b"host:") {
                 new_headers.extend_from_slice(format!("Host: {}\r\n", host).as_bytes());
             } else {
@@ -431,13 +438,10 @@ async fn handle_client(
                 new_headers.extend_from_slice(b"\r\n");
             }
         }
-        // ✅ THIS is the important line
+        // end of headers
         new_headers.extend_from_slice(b"\r\n");
 
-        // rebuild full request
-        let new_request = new_headers;
-
-        modified = new_request;
+        modified = new_headers;
     }
 
     let upstream_start = Instant::now();
