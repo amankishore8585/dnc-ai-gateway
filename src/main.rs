@@ -421,19 +421,19 @@ async fn handle_client(
         let host = upstream_addr.split(':').next().unwrap_or("");
 
         // rebuild headers with correct Host
-        let mut new_headers = String::new();
+        let mut new_headers = Vec::new();
 
-        for line in headers_str.lines() {
-            if line.to_lowercase().starts_with("host:") {
-                new_headers.push_str(&format!("Host: {}\r\n", host));
+        for line in headers.split(|&b| b == b'\n') {
+            if line.starts_with(b"Host:") || line.starts_with(b"host:") {
+                new_headers.extend_from_slice(format!("Host: {}\r\n", host).as_bytes());
             } else {
-                new_headers.push_str(line);
-                new_headers.push_str("\r\n");
+                new_headers.extend_from_slice(line);
+                new_headers.extend_from_slice(b"\n");
             }
         }
 
         // rebuild full request
-        let new_request = new_headers.into_bytes();
+        let new_request = new_headers;
 
         modified = new_request;
     }
