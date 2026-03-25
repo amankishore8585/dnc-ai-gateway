@@ -408,8 +408,11 @@ Requests/sec: ~60,000
 
 Personal project
 
-## Contact
+## 💬 Early Access / Setup Help
 
-For questions, feedback, or collaboration
+If you're using AI APIs and want help setting up the gateway (auth, rate limiting, logging) for your app, feel free to reach out.
 
-dncsoftwarehelp@gmail.com
+I'm open to helping early users get started and would love feedback from real use cases.
+
+Contact: dncsoftwarehelp@gmail.com
+
