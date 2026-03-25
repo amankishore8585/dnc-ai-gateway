@@ -106,6 +106,31 @@ Client Application
 
 This is not a prompt router or model orchestrator.
 
+### Scope
+
+This gateway is designed as an **infrastructure layer**, not an application-layer AI proxy.
+
+It does not:
+- modify prompts or responses
+- perform model selection
+- handle caching or cost tracking
+
+Instead, it focuses on:
+- traffic control
+- security
+- reliability
+- observability
+
+This makes it a good foundation layer that can be combined with application-level tools such as LiteLLM or OpenRouter.
+
+Example architecture:
+
+App → LiteLLM / OpenRouter → AI Gateway → AI Provider
+
+In this setup:
+- LiteLLM/OpenRouter handle model logic, caching, and cost tracking
+- AI Gateway handles authentication, rate limiting, routing, and logging
+
 ## Quick Start (Local)
 
 ### 1. Clone the repo
