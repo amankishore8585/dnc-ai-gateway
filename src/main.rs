@@ -1,5 +1,13 @@
 const VERSION: &str = "0.1.0";
 
+#[derive(Default)]
+struct UserStats {
+    requests: u64,
+    total_latency: u128,
+    errors: u64,
+    total_cost: f64,
+}
+
 mod metrics;
 mod rate_limiter;
 mod load_balancer;
@@ -12,7 +20,7 @@ use config::{ApiKeys, load_api_keys};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-type UsageMap = Arc<Mutex<HashMap<String, u64>>>;
+type UsageMap = Arc<Mutex<HashMap<String, HashMap<String, UserStats>>>>;
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -30,6 +38,14 @@ trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 type Balancers = Arc<Mutex<HashMap<String, LoadBalancer>>>;
+
+fn get_model_price(model: &str) -> (f64, f64) {
+    match model {
+        "gpt-4o-mini" => (0.00015, 0.0006),
+        "gpt-4o" => (0.005, 0.015),
+        _ => (0.0, 0.0), // unknown model
+    }
+}
 
 fn init_logging() {
     tracing_subscriber::fmt()
@@ -243,12 +259,53 @@ async fn handle_client(
     let request_str = String::from_utf8_lossy(&buffer);
     let req = parse_request(&request_str);
 
+    let model = if req.path.contains("/chat/completions") {
+        "gpt-4o-mini".to_string() // default for now
+    } else {
+        "unknown".to_string()
+    };
+
     if req.path == "/stats" && req.method == "GET" {
         // 🔒 lock only briefly
         let json = {
             let map = usage_map.lock().unwrap();
-            serde_json::to_string(&*map).unwrap()
-        }; // ✅ lock is dropped HERE
+
+            let result: HashMap<_, _> = map.iter().map(|(user, routes)| {
+                
+                let route_map: HashMap<_, _> = routes.iter().map(|(route, stats)| {
+                
+                    let avg_latency = if stats.requests > 0 {
+                        stats.total_latency / stats.requests as u128
+                    } else {
+                        0
+                    };
+                
+                    let error_rate = if stats.requests > 0 {
+                        stats.errors as f64 / stats.requests as f64
+                    } else {
+                        0.0
+                    };
+                
+                    (
+                        route.clone(),
+                        serde_json::json!({
+                            "requests": stats.requests,
+                            "avg_latency_ms": avg_latency,
+                            "errors": stats.errors,
+                            "error_rate": error_rate,
+                            "estimated_total_cost": stats.total_cost
+                        })
+                    )
+                
+                }).collect();
+                
+                (user.clone(), route_map) 
+
+            }).collect();
+
+            serde_json::to_string(&result).unwrap() // ✅ OUTSIDE map    
+        
+        };
 
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
@@ -311,7 +368,7 @@ async fn handle_client(
             send_response(
                 &mut client,
                 "403 Forbidden",
-                "",
+                "Invalid API Key",
                 &request_id,
                 start
             ).await;
@@ -322,12 +379,23 @@ async fn handle_client(
     // count usage
     {
         let mut map = usage_map.lock().unwrap();
-        *map.entry(user_id.clone()).or_insert(0) += 1;
+        let user_entry = map.entry(user_id.clone()).or_default();
+        let route_entry = user_entry.entry(req.path.clone()).or_default();
+        route_entry.requests += 1;
     }
     
+    let total_requests = {
+        let map = usage_map.lock().unwrap();
+        map.get(&user_id)
+            .and_then(|routes| routes.get(&req.path))
+            .map(|stats| stats.requests)
+            .unwrap_or(0)
+    };
+
     info!(
         user_id = %user_id,
-        total_requests = %usage_map.lock().unwrap().get(&user_id).unwrap(),
+        route = %req.path,
+        total_requests = %total_requests,
         "user_usage_updated"
     );
 
@@ -528,7 +596,32 @@ async fn handle_client(
     upstream_latency_ms = upstream_start.elapsed().as_millis();
     
     // close client connection cleanly
-    let _ = client.shutdown().await;    
+    let _ = client.shutdown().await;
+    
+    {
+        let mut map = usage_map.lock().unwrap();
+        if let Some(user_stats) = map.get_mut(&user_id) {
+            if let Some(route_stats) = user_stats.get_mut(&req.path) {
+
+                // latency
+                route_stats.total_latency += upstream_latency_ms;
+
+                // errors
+                if upstream_status_code >= 400 {
+                    route_stats.errors += 1;
+                }
+
+                // cost
+                let estimated_cost = match model.as_str() {
+                    "gpt-4o-mini" => 0.0005,
+                    "gpt-4o" => 0.01,
+                    _ => 0.0,
+                };
+
+                route_stats.total_cost += estimated_cost;
+            }
+        }
+    }
 
     //for request log
     log_request(
