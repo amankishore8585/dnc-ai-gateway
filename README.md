@@ -116,7 +116,7 @@ Streaming Proxy (bidirectional)
 Response to Client
 
 ### System View
-
+```text
 Client Application
         |
         v
@@ -136,7 +136,7 @@ Client Application
 |      AI Provider       |
 |    (OpenAI API)        |
 +------------------------+
-
+```
 ### Design Note (v1)
 
 * Do not modify request bodies
