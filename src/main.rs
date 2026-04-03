@@ -332,7 +332,10 @@ async fn handle_client(
 
     // 🔐 API KEY AUTHENTICATION
     let api_key = match authenticate(&req).await {
-        Some(k) => k,
+        Some(k) => {
+            AUTH_SUCCESS.fetch_add(1, Ordering::Relaxed);
+            k
+        }
         None => {
             AUTH_FAILURES.fetch_add(1, Ordering::Relaxed);
 
@@ -415,7 +418,7 @@ async fn handle_client(
         ).await;
         return;
     }
-    SUCCESSFUL_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    GATEWAY_ACCEPTED.fetch_add(1, Ordering::Relaxed);
 
     // -------- routing --------
     let upstream_addr = {
@@ -609,6 +612,9 @@ async fn handle_client(
                 // errors
                 if upstream_status_code >= 400 {
                     route_stats.errors += 1;
+                    UPSTREAM_FAILURES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    UPSTREAM_SUCCESS.fetch_add(1, Ordering::Relaxed);
                 }
 
                 // cost
