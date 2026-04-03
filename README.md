@@ -320,7 +320,7 @@ curl http://127.0.0.1:8080/stats | jq
 (install jq for pretty JSON output if needed)
 
 Example Output
-
+```
 {
   "user1:127.0.0.1": {
     "/v1/chat/completions": {
@@ -332,7 +332,7 @@ Example Output
     }
   }
 }
-
+```
 ## Using the Gateway
 
 The AI Gateway sits between your application and AI providers, giving you centralized control over traffic, security, and observability.
@@ -343,7 +343,7 @@ Instead of calling OpenAI directly:
 Route all requests through the gateway:
 ```App → AI Gateway → OpenAI```
 
-🧠 Typical Use Case
+**🧠 Typical Use Case**
 Example: Chatbot Startup
 
 A backend service sending requests to OpenAI can use the gateway to:
