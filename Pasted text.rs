@@ -1,41 +1,11 @@
-// ============================================================
-// AI GATEWAY CORE
-// ------------------------------------------------------------
-// Acts as a reverse proxy for AI APIs (OpenAI for now)
-//
-// Flow:
-// Client → Gateway → Upstream (OpenAI) → Gateway → Client
-//
-// Features:
-// - API Key authentication
-// - Rate limiting (token bucket)
-// - Load balancing
-// - TLS support
-// - Token usage extraction
-// - Metrics + Stats tracking
-// ============================================================
-
 const VERSION: &str = "0.1.0";
 
-// ------------------------------------------------------------
-// Per-user per-route statistics (stored in memory)
-// ------------------------------------------------------------
-// Tracks:
-// - request count
-// - latency
-// - errors
-// - cost (currently estimated, will be token-based)
-// - token usage (prompt + completion)
-// ------------------------------------------------------------
 #[derive(Default)]
 struct UserStats {
     requests: u64,
     total_latency: u128,
     errors: u64,
     total_cost: f64,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    total_tokens: u64,
 }
 
 mod metrics;
@@ -50,17 +20,7 @@ use config::{ApiKeys, load_api_keys};
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-type UsageMap = Arc<
-    Mutex<
-        HashMap<
-            String, // user_id
-            HashMap<
-                String, // route
-                HashMap<String, UserStats> // model → stats
-            >
-        >
-    >
->;
+type UsageMap = Arc<Mutex<HashMap<String, HashMap<String, UserStats>>>>;
 
 use std::sync::atomic::Ordering;
 use std::time::Instant;
@@ -79,16 +39,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 type Balancers = Arc<Mutex<HashMap<String, LoadBalancer>>>;
 
-
-// ------------------------------------------------------------
-// Model pricing (per 1K tokens)
-// ------------------------------------------------------------
-// Returns: (input_price, output_price)
-//
-// NOTE:
-// - Used later for real cost calculation
-// - Currently not fully wired into stats
-// ------------------------------------------------------------
 fn get_model_price(model: &str) -> (f64, f64) {
     match model {
         "gpt-4o-mini" => (0.00015, 0.0006),
@@ -110,18 +60,6 @@ pub struct Request {
     version: String,
     headers: HashMap<String, String>,
 }
-
-// ------------------------------------------------------------
-// Basic HTTP request parser
-// ------------------------------------------------------------
-// Extracts:
-// - method (GET, POST)
-// - path (/v1/chat/completions)
-// - headers
-//
-// NOTE:
-// - Minimal parsing (not full HTTP compliant)
-// ------------------------------------------------------------
 
 fn parse_request(request: &str) -> Request {
     let request_line = request.lines().next().unwrap_or("");
@@ -150,14 +88,6 @@ fn parse_request(request: &str) -> Request {
     }
 }
 
-// ------------------------------------------------------------
-// /metrics endpoint (Prometheus-style)
-// ------------------------------------------------------------
-// Returns internal counters:
-// - requests
-// - failures
-// - rate limits
-// ------------------------------------------------------------
 
 async fn handle_metrics(req: &Request, client: &mut TcpStream) -> bool {
     if req.path == "/metrics" {
@@ -176,12 +106,6 @@ async fn handle_metrics(req: &Request, client: &mut TcpStream) -> bool {
     false
 }
 
-// ------------------------------------------------------------
-// API Key authentication
-// ------------------------------------------------------------
-// Reads X-API-Key header
-// Returns key if present
-// ------------------------------------------------------------
 async fn authenticate(req: &Request) -> Option<String> {
     req.headers.get("X-API-Key").cloned()
 }
@@ -208,13 +132,6 @@ async fn send_response(
     let _ = client.write_all(response.as_bytes()).await;
 }
 
-
-// ------------------------------------------------------------
-// Rate limiting (Token Bucket per user + route)
-// ------------------------------------------------------------
-// Each API key has buckets per route
-// Controls request rate
-// ------------------------------------------------------------
 async fn check_rate_limit(
     api_key: &str,
     path: &str,
@@ -242,16 +159,6 @@ async fn check_rate_limit(
     false
 }
 
-// ------------------------------------------------------------
-// Request logging
-// ------------------------------------------------------------
-// Logs:
-// - request_id
-// - latency
-// - upstream status
-// - user + API key
-// ------------------------------------------------------------
-
 fn log_request(
     req: &Request,
     start: Instant,
@@ -276,13 +183,6 @@ fn log_request(
         "request_completed"
     );
 }
-
-// ------------------------------------------------------------
-// Connect to upstream with retry + timeout
-// ------------------------------------------------------------
-// Attempts connection up to 2 times
-// Used for fault tolerance
-// ------------------------------------------------------------
 
 async fn connect_with_retry(addr: String, request_id: &str) -> Option<TcpStream> {
     for attempt in 1..=2 {
@@ -311,41 +211,6 @@ async fn connect_with_retry(addr: String, request_id: &str) -> Option<TcpStream>
     None
 }
 
-
-fn extract_model_from_body(buffer: &[u8]) -> String {
-    if let Some(header_end) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-        let body = &buffer[header_end + 4..];
-
-        if let Ok(body_str) = std::str::from_utf8(body) {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(body_str) {
-                if let Some(model) = json.get("model").and_then(|m| m.as_str()) {
-                    return model.to_string();
-                }
-            }
-        }
-    }
-
-    "unknown".to_string()
-}
-
-
-// ============================================================
-// MAIN REQUEST HANDLER (CORE LOGIC)
-// ------------------------------------------------------------
-// Handles full lifecycle:
-//
-// 1. Read request
-// 2. Parse HTTP
-// 3. Authenticate
-// 4. Rate limit
-// 5. Route request
-// 6. Forward to upstream
-// 7. Read response
-// 8. Extract token usage (if OpenAI)
-// 9. Send response back
-// 10. Update stats + logs
-// ============================================================
-
 async fn handle_client(
     mut client: TcpStream,
     limiter: RateLimiter,
@@ -369,9 +234,7 @@ async fn handle_client(
     let mut buffer = Vec::new();
     let mut temp = [0u8; 1024];
 
-    // ---- STEP 1: Read request headers ----
-    // Reads until \r\n\r\n (end of headers)
-    // Body handled separately
+    // ---- STEP 1: read headers only ----
     loop {
         let n = match client.read(&mut temp).await {
             Ok(0) => break,
@@ -392,69 +255,58 @@ async fn handle_client(
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| "unknown".to_string());
 
-    // ---- STEP 2: Parse incoming HTTP request ----
-
+    //parsing
     let request_str = String::from_utf8_lossy(&buffer);
     let req = parse_request(&request_str);
 
     let should_parse = req.path.contains("/chat/completions");
 
     let model = if req.path.contains("/chat/completions") {
-        extract_model_from_body(&buffer)
+        "gpt-4o-mini".to_string() // default for now
     } else {
         "unknown".to_string()
     };
 
-    // ---- STEP 3: Handle /stats endpoint ----
-    // Returns aggregated usage data
-
     if req.path == "/stats" && req.method == "GET" {
+        // 🔒 lock only briefly
         let json = {
             let map = usage_map.lock().unwrap();
 
             let result: HashMap<_, _> = map.iter().map(|(user, routes)| {
-            
-                let route_map: HashMap<_, _> = routes.iter().map(|(route, models)| {
-
-                    let model_map: HashMap<_, _> = models.iter().map(|(model, stats)| {
-
-                        let avg_latency = if stats.requests > 0 {
-                            stats.total_latency / stats.requests as u128
-                        } else {
-                            0
-                        };
-
-                        let error_rate = if stats.requests > 0 {
-                            stats.errors as f64 / stats.requests as f64
-                        } else {
-                            0.0
-                        };
-
-                        (
-                            model.clone(),
-                            serde_json::json!({
-                                "requests": stats.requests,
-                                "avg_latency_ms": avg_latency,
-                                "errors": stats.errors,
-                                "error_rate": error_rate,
-                                "total_cost": stats.total_cost,
-                                "prompt_tokens": stats.prompt_tokens,
-                                "completion_tokens": stats.completion_tokens,
-                                "total_tokens": stats.total_tokens,
-                            })
-                        )
-
-                    }).collect();
-
-                    (route.clone(), model_map)
-
+                
+                let route_map: HashMap<_, _> = routes.iter().map(|(route, stats)| {
+                
+                    let avg_latency = if stats.requests > 0 {
+                        stats.total_latency / stats.requests as u128
+                    } else {
+                        0
+                    };
+                
+                    let error_rate = if stats.requests > 0 {
+                        stats.errors as f64 / stats.requests as f64
+                    } else {
+                        0.0
+                    };
+                
+                    (
+                        route.clone(),
+                        serde_json::json!({
+                            "requests": stats.requests,
+                            "avg_latency_ms": avg_latency,
+                            "errors": stats.errors,
+                            "error_rate": error_rate,
+                            "estimated_total_cost": stats.total_cost
+                        })
+                    )
+                
                 }).collect();
-
-                (user.clone(), route_map)
+                
+                (user.clone(), route_map) 
 
             }).collect();
 
-            serde_json::to_string(&result).unwrap()
+            serde_json::to_string(&result).unwrap() // ✅ OUTSIDE map    
+        
         };
 
         let response = format!(
@@ -480,8 +332,7 @@ async fn handle_client(
         return;
     }
 
-    // ---- STEP 4: API Key Authentication ----
-
+    // 🔐 API KEY AUTHENTICATION
     let api_key = match authenticate(&req).await {
         Some(k) => {
             AUTH_SUCCESS.fetch_add(1, Ordering::Relaxed);
@@ -530,15 +381,19 @@ async fn handle_client(
         }
     };
 
-    // ---- STEP 5: Track request count ----
+    // count usage
+    {
+        let mut map = usage_map.lock().unwrap();
+        let user_entry = map.entry(user_id.clone()).or_default();
+        let route_entry = user_entry.entry(req.path.clone()).or_default();
+        route_entry.requests += 1;
+    }
     
     let total_requests = {
         let map = usage_map.lock().unwrap();
         map.get(&user_id)
             .and_then(|routes| routes.get(&req.path))
-            .map(|models| {
-                models.values().map(|s| s.requests).sum::<u64>()
-            })
+            .map(|stats| stats.requests)
             .unwrap_or(0)
     };
 
@@ -548,7 +403,6 @@ async fn handle_client(
         total_requests = %total_requests,
         "user_usage_updated"
     );
-    // ---- STEP 6: Rate limiting ----
 
     if check_rate_limit(&api_key, &req.path, limit, &limiter).await {
         warn!(
@@ -568,7 +422,7 @@ async fn handle_client(
     }
     GATEWAY_ACCEPTED.fetch_add(1, Ordering::Relaxed);
 
-    // ---- STEP 7: Route request to upstream ----
+    // -------- routing --------
     let upstream_addr = {
         let mut map = balancers.lock().unwrap();
 
@@ -605,8 +459,7 @@ async fn handle_client(
         "routing"
     );
 
-    // ---- STEP 8: Connect to upstream (TLS or TCP) ----
-
+    // connect to backend with timeout
     let mut upstream: Box<dyn IoStream> =
         if upstream_addr.ends_with(":443") {
 
@@ -682,8 +535,7 @@ async fn handle_client(
 
     let mut modified = buffer.clone();
 
-    // ---- STEP 9: Forward request to upstream ----
-    // Fix Host header + send body
+    // ---- find end of headers ----
     if let Some(headers_end) = modified.windows(4).position(|w| w == b"\r\n\r\n") {
 
         let mut headers = modified[..headers_end + 4].to_vec();
@@ -726,11 +578,7 @@ async fn handle_client(
         upstream.write_all(already_read_body).await.unwrap();
     }
 
-    // ---- STEP 10: Read upstream response ----
-    // Handles:
-    // - chunked encoding
-    // - content-length fallback
-    
+    // ✅ FIX: read remaining body using Content-Length (no hanging)
     let content_length = req
         .headers
         .get("Content-Length")
@@ -750,10 +598,6 @@ async fn handle_client(
 
         upstream.write_all(&remaining_buf).await.unwrap();
     }
-
-    let mut prompt_tokens: u64 = 0;
-    let mut completion_tokens: u64 = 0;
-    let mut total_tokens: u64 = 0;
 
     if should_parse {
 
@@ -788,28 +632,26 @@ async fn handle_client(
 
         if is_chunked {
 
-            // 🔥 capture already-read body
-            let mut body = response_buffer[header_end..].to_vec();
+            let mut body = Vec::new();
 
-        loop {
-            let mut buf = [0u8; 1024];
+            loop {
+                let mut buf = [0u8; 1024];
 
-            let n = upstream.read(&mut buf).await.unwrap();
+                let n = upstream.read(&mut buf).await.unwrap();
 
-            if n == 0 {
-                break;
+                if n == 0 {
+                    break;
+                }
+
+                body.extend_from_slice(&buf[..n]);
+
+                // 🔥 detect end of chunked stream
+                if body.windows(5).any(|w| w == b"0\r\n\r\n") {
+                    break;
+                }
             }
 
-            body.extend_from_slice(&buf[..n]);
-
-            if body.windows(5).any(|w| w == b"0\r\n\r\n") {
-                break;
-            }
-        }
-
-        // 🔥 rebuild full response
-        response_buffer.truncate(header_end);
-        response_buffer.extend_from_slice(&body);
+            response_buffer.extend_from_slice(&body);
         
         } else {
             // fallback: content-length
@@ -831,30 +673,14 @@ async fn handle_client(
         }
 
 
-        // ---- STEP 11: Parse OpenAI response ----
-        // Extract token usage from JSON
-        // (only for /chat/completions)
-        
+        // ---- parse WITHOUT modifying ----
         if let Some(split_pos) = response_buffer
             .windows(4)
             .position(|w| w == b"\r\n\r\n")
         {
             let body = &response_buffer[split_pos + 4..];
 
-            if let Ok(body_str_raw) = std::str::from_utf8(body) {
-
-                // 🔥 CLEAN CHUNKED GARBAGE (hex chunk sizes like 1b, 32c, 0)
-                let cleaned: String = body_str_raw
-                    .lines()
-                    .filter(|line| {
-                        let l = line.trim();
-                        // remove pure hex lines (chunk sizes)
-                        !l.chars().all(|c| c.is_ascii_hexdigit())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-
-                let body_str = cleaned;
+            if let Ok(body_str) = std::str::from_utf8(body) {
 
                 // 🔥 DEBUG
                 println!("BODY DEBUG:\n{}\n----END----", body_str);
@@ -862,9 +688,8 @@ async fn handle_client(
                 // 🔥 extract JSON safely
                 if let Some(start) = body_str.find('{') {
                     if let Some(end) = body_str.rfind('}') {
-                    
+
                     let json_str = &body_str[start..=end];
-                    let json_str = json_str.trim();
 
                     println!("EXTRACTED JSON:\n{}\n----END JSON----", json_str);
 
@@ -872,13 +697,13 @@ async fn handle_client(
 
                         if let Some(usage) = json.get("usage") {
 
-                            prompt_tokens = usage.get("prompt_tokens")
+                            let prompt_tokens = usage.get("prompt_tokens")
                                 .and_then(|v| v.as_u64()).unwrap_or(0);
 
-                            completion_tokens = usage.get("completion_tokens")
+                            let completion_tokens = usage.get("completion_tokens")
                                 .and_then(|v| v.as_u64()).unwrap_or(0);
 
-                            total_tokens = usage.get("total_tokens")
+                            let total_tokens = usage.get("total_tokens")
                                 .and_then(|v| v.as_u64()).unwrap_or(0);
 
                             info!(
@@ -906,7 +731,7 @@ async fn handle_client(
             println!("BODY NOT UTF-8");
         }
     }
-        
+        }
 
         // 🚨 send EXACT same bytes (do not modify)
         let _ = client.write_all(&response_buffer).await;
@@ -932,46 +757,35 @@ async fn handle_client(
     // close client connection cleanly
     let _ = client.shutdown().await;
     
-    // ---- STEP 13: Update usage stats ----
-    // latency, errors, cost
-    
     {
         let mut map = usage_map.lock().unwrap();
+        if let Some(user_stats) = map.get_mut(&user_id) {
+            if let Some(route_stats) = user_stats.get_mut(&req.path) {
 
-        let user_entry = map.entry(user_id.clone()).or_default();
-        let route_entry = user_entry.entry(req.path.clone()).or_default();
-        let model_entry = route_entry.entry(model.clone()).or_default();
+                // latency
+                route_stats.total_latency += upstream_latency_ms;
 
-        // latency
-        model_entry.total_latency += upstream_latency_ms;
+                // errors
+                if upstream_status_code >= 400 {
+                    route_stats.errors += 1;
+                    UPSTREAM_FAILURES.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    UPSTREAM_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                }
 
-        // errors
-        if upstream_status_code >= 400 {
-            model_entry.errors += 1;
-            UPSTREAM_FAILURES.fetch_add(1, Ordering::Relaxed);
-        } else {
-            UPSTREAM_SUCCESS.fetch_add(1, Ordering::Relaxed);
+                // cost
+                let estimated_cost = match model.as_str() {
+                    "gpt-4o-mini" => 0.0005,
+                    "gpt-4o" => 0.01,
+                    _ => 0.0,
+                };
+
+                route_stats.total_cost += estimated_cost;
+            }
         }
-
-        // 🔥 REAL TOKEN-BASED COST
-        let (input_price, output_price) = get_model_price(&model);
-
-        let cost =
-            (prompt_tokens as f64 / 1000.0) * input_price +
-            (completion_tokens as f64 / 1000.0) * output_price;
-
-        model_entry.total_cost += cost;
-
-        // 🔥 TOKENS
-        model_entry.prompt_tokens += prompt_tokens;
-        model_entry.completion_tokens += completion_tokens;
-        model_entry.total_tokens += total_tokens;
-
-        // 🔥 requests count (IMPORTANT: move it here ideally)
-        model_entry.requests += 1;
     }
 
-    // ---- STEP 14: Final request log ----
+    //for request log
     log_request(
         &req,
         start,
