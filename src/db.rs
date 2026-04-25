@@ -2,7 +2,7 @@ use tokio_postgres::{NoTls, Client};
 
 pub async fn connect_db() -> Client {
     let (client, connection) =
-        tokio_postgres::connect("host=localhost user=postgres password=postgres dbname=postgres", NoTls)
+        tokio_postgres::connect("host=localhost user=gateway_user password=strongpassword dbname=ai_gateway", NoTls)
             .await
             .expect("Failed to connect to DB");
 
