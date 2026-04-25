@@ -486,7 +486,7 @@ async fn handle_client(
                         (
                             model.clone(),
                             serde_json::json!({
-                                "requests": stats.requests,
+                                "upstream_requests": stats.requests,
                                 "avg_latency_ms": avg_latency,
                                 "errors": stats.errors,
                                 "error_rate": error_rate,
@@ -571,9 +571,19 @@ async fn handle_client(
                 route,
                 model,
                 COUNT(*) as requests,
+
+                -- ✅ cache hits
+                SUM(
+                    CASE 
+                        WHEN total_tokens = 0 AND cost = 0 THEN 1 
+                        ELSE 0 
+                    END
+                ) as cache_hits,
+
                 SUM(total_tokens)::BIGINT as total_tokens,
                 SUM(cost)::DOUBLE PRECISION as total_cost,
                 AVG(latency_ms)::DOUBLE PRECISION as avg_latency
+
             FROM usage_logs"
         
         );
@@ -622,6 +632,14 @@ async fn handle_client(
 
             let requests: i64 = row.get::<_, i64>("requests");
 
+            let cache_hits: i64 = row.get("cache_hits");
+
+            let cache_hit_rate = if requests > 0 {
+                cache_hits as f64 / requests as f64
+            } else {
+                0.0
+            };
+
             let total_tokens: i64 = row.get("total_tokens");
             let total_cost: f64 = row.get("total_cost");
             let avg_latency: f64 = row.get("avg_latency");
@@ -633,6 +651,8 @@ async fn handle_client(
                 model,
                 json!({
                     "requests": requests,
+                    "cache_hits": cache_hits,
+                    "cache_hit_rate": cache_hit_rate,
                     "total_tokens": total_tokens,
                     "total_cost": total_cost,
                     "avg_latency_ms": avg_latency
