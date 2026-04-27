@@ -1142,6 +1142,33 @@ async fn handle_client(
             } else {
                 println!("DECHUNK FAILED — USING RAW BODY");
             }
+
+            // 🔥 FIX: update headers after dechunking
+            if cleaned.len() > 0 {
+                if let Some(h_end) = response_buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+
+                let headers_part = &response_buffer[..h_end];
+                let headers_str = String::from_utf8_lossy(headers_part).to_string();
+
+                // remove Transfer-Encoding
+                let filtered_headers: String = headers_str
+                    .lines()
+                    .filter(|l| !l.to_lowercase().starts_with("transfer-encoding"))
+                    .collect::<Vec<_>>()
+                    .join("\r\n");
+
+                let new_headers = format!(
+                    "{}\r\nContent-Length: {}\r\n\r\n",
+                    filtered_headers,
+                    cleaned.len()
+                );
+
+                let mut new_response = new_headers.into_bytes();
+                new_response.extend_from_slice(&cleaned);
+
+                response_buffer = new_response;
+            }
+        }
         
         
         } else {
