@@ -1161,19 +1161,7 @@ async fn handle_client(
 
             if let Ok(body_str_raw) = std::str::from_utf8(&body_bytes) {
 
-                // 🔥 CLEAN CHUNKED GARBAGE (hex chunk sizes like 1b, 32c, 0)
-                let cleaned: String = body_str_raw
-                    .lines()
-                    .filter(|line| {
-                        let l = line.trim();
-                        // remove pure hex lines (chunk sizes)
-                        !l.chars().all(|c| c.is_ascii_hexdigit())
-                    })
-                    .collect::<Vec<_>>()
-                    .join("");
-
-                let body_str = cleaned;
-
+                let body_str = body_str_raw.to_string();
                 // 🔥 DEBUG
                 //println!("BODY DEBUG:\n{}\n----END----", body_str);
 
