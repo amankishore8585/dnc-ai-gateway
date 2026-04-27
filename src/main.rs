@@ -1082,28 +1082,67 @@ async fn handle_client(
 
         if is_chunked {
 
-            // 🔥 capture already-read body
             let mut body = response_buffer[header_end..].to_vec();
 
-        loop {
-            let mut buf = [0u8; 1024];
+            loop {
+                let mut buf = [0u8; 1024];
+                let n = upstream.read(&mut buf).await.unwrap();
 
-            let n = upstream.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
 
-            if n == 0 {
-                break;
+                body.extend_from_slice(&buf[..n]);
+
+                if body.windows(5).any(|w| w == b"0\r\n\r\n") {
+                    break;
+                }
             }
 
-            body.extend_from_slice(&buf[..n]);
+            // 🔥 SIMPLE FIX: remove chunk size lines (but KEEP binary safe)
+            let mut cleaned = Vec::new();
+            let mut i = 0;
 
-            if body.windows(5).any(|w| w == b"0\r\n\r\n") {
-                break;
+            while i < body.len() {
+                // find next \r\n (end of chunk size line)
+                let mut j = i;
+                while j + 1 < body.len() && !(body[j] == b'\r' && body[j + 1] == b'\n') {
+                    j += 1;
+                }
+
+                if j + 1 >= body.len() {
+                    break;
+                }
+
+                // parse chunk size
+                let size_str = String::from_utf8_lossy(&body[i..j]);
+                let size = usize::from_str_radix(size_str.trim(), 16).unwrap_or(0);
+
+                if size == 0 {
+                    break;
+                }
+
+                i = j + 2; // skip \r\n
+
+                if i + size > body.len() {
+                    break;
+                }
+
+                cleaned.extend_from_slice(&body[i..i + size]);
+
+                i += size + 2; // skip data + \r\n
+                }
+
+            println!("CLEANED SIZE: {}", cleaned.len());
+
+            // fallback safety
+            if cleaned.len() > 0 {
+                response_buffer.truncate(header_end);
+                response_buffer.extend_from_slice(&cleaned);
+            } else {
+                println!("DECHUNK FAILED — USING RAW BODY");
             }
-        }
-
-        // 🔥 rebuild full response
-        response_buffer.truncate(header_end);
-        response_buffer.extend_from_slice(&body);
+        
         
         } else {
             // fallback: content-length
