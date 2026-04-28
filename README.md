@@ -1,6 +1,6 @@
 # DNC AI Gateway (Rust)
 
-DNC AI Gateway is a lightweight infra-layer proxy for AI APIs, focused on control, reliability, and observability.
+DNC AI Gateway is a lightweight infrastructure-layer proxy for AI APIs, focused on control, reliability, observability, and cost efficiency.
 
 Instead of calling OpenAI (or other providers) directly from your app:
 
@@ -10,21 +10,30 @@ You route through the gateway:
 
   App → AI Gateway → OpenAI
 
-This lets you enforce policies, track usage, and manage traffic centrally.
+This enables:
+
+  • centralized authentication and rate limiting  
+  • intelligent response caching (reducing latency and cost)  
+  • token-level usage tracking and cost estimation  
+  • structured logging and observability  
+  • controlled and reliable traffic routing  
+
+All without changing your application logic.
 
 ## What Problem This Solves
 
 AI APIs introduce new challenges in production:
 
-* No centralized rate limiting → risk of abuse and cost spikes
-* Hard to track usage and latency
-* No visibility into estimated cost or per-user usage
-* No control over traffic routing (retries, load balancing, multiple backends)
-* No unified view of requests, latency, and failures — making debugging difficult across services
+* No centralized rate limiting → risk of abuse and cost spikes  
+* Hard to track usage, latency, and token consumption  
+* No visibility into real cost or per-user usage  
+* Repeated identical requests → unnecessary latency and cost  
+* No control over traffic routing (retries, load balancing, multiple backends)  
+* No unified view of requests, latency, cache behavior, and failures — making debugging difficult across services  
 
-This gateway solves that at the infrastructure level, not the application level.
+This gateway solves these problems at the infrastructure layer, without requiring changes to application logic.
 
-## Features (v1)
+## Features (v2)
 
 ### 🔐 Backend Security & Control
 
@@ -52,28 +61,24 @@ This gateway solves that at the infrastructure level, not the application level.
 
 ### ⚡ Full Protocol Support (Data Plane)
 
-#### Streaming Proxy (Chunked + JSON Safe)
-* Fully supports:
-  * chunked requests
-  * large payloads
-  * streaming responses
-* No buffering → low latency
+#### Streaming Proxy (Chunked Support)
+* Supports chunked transfer encoding
+* Handles large payloads safely
+* Selective buffering for response parsing (token extraction & caching)
 
 #### TLS Support
 * Automatic HTTPS handling for upstream APIs
 
-### 📊 Aggregation & Usage Stats(/stats)
+### 📊 Observability & Usage Insights
 
 #### Per-User & Per-Route Stats
 * Request counts
 * Average latency
 * Error rate
 
-#### Cost Estimation
-* Estimated usage cost per request
-* Aggregated per user
-
-### 📈 Observability
+#### Cost Tracking (Token-Based)
+* Cost calculated using actual token usage from responses
+* Aggregated per user, route, and model
 
 #### Structured Logging
 * request_id
@@ -90,10 +95,67 @@ This gateway solves that at the infrastructure level, not the application level.
 * upstream_success (connection-level)
 * upstream_failures (connection-level)
 
+#### Cache Metrics
+* Cache hits
+* Cache hit rate
+* Reduced latency for repeated requests
+
+### ⚡ Intelligent Caching Layer
+
+#### Response Caching (Prompt-Based)
+
+* Caches full OpenAI responses based on:
+    model (normalized) + normalized prompt
+* Eliminates duplicate requests to upstream APIs
+* Reduces latency and cost significantly
+
+#### Cache Hit Optimization
+
+* Cache hits return instantly (no upstream call)
+* Transparent to client applications
+
+#### Database-backed Cache
+
+* Persistent storage using PostgreSQL
+* Survives restarts
+
+### 💰 Token Usage Tracking
+
+#### Token Usage Extraction
+
+* Parses OpenAI JSON responses
+* Extracts:
+  * prompt_tokens
+  * completion_tokens
+  * total_tokens
+
+#### Accurate Cost Calculation
+
+* Cost calculated per request using model pricing
+* Aggregated per user and route
+
+#### Stored in Database
+
+* Usage logs persisted for analytics and billing
+
+### Database Integration
+
+#### PostgreSQL Integration
+
+* Stores:
+  * prompt_cache (cached responses)
+  * usage_logs (token usage + cost)
+
+* Enables:
+  * Persistent caching
+  * Historical usage tracking
+  * Foundation for analytics & billing 
 
 ## Architecture
 
 The gateway is structured as a layered infrastructure proxy, separating control, data flow, and observability
+
+
 
 ### Request Flow
 
@@ -107,11 +169,21 @@ Authentication (API Key)
       ↓
 Rate Limiting
       ↓
+Request Normalization (extract model + prompt)
+      ↓
+Cache Check (prompt-based)
+      ↓
 Routing + Load Balancing
       ↓
 Upstream Connection (Retry + TLS)
       ↓
-Streaming Proxy (bidirectional)
+Upstream Response Received
+      ↓
+Response Normalization (dechunk / decode if needed)
+      ↓
+Token Extraction (usage + model)
+      ↓
+Cache Store (async)
       ↓
 Response to Client
 ```
@@ -120,31 +192,37 @@ Response to Client
 Client Application
         |
         v
-+------------------------+
-|       AI Gateway       |
-|------------------------|
-| Auth & Rate Limiting   |
-| Routing & Load Balance |
-| Retry & Health Checks  |
-| Streaming Data Plane   |
-| Aggregation            |
-| Metrics & Logs         |
-+-----------+------------+
++-----------------------------+
+|        AI Gateway           |
+|-----------------------------|
+| Auth & Rate Limiting        |
+| Request Normalization       |
+| Cache Layer (DB-backed)     |
+| Routing & Load Balancing    |
+| Retry & Health Checks       |
+| Response Processing         |
+|  - Dechunk / Decode         |
+|  - Token Extraction         |
+| Metrics & Logs              |
++-------------+---------------+
             |
             v
-+------------------------+
-|      AI Provider       |
-|    (OpenAI API)        |
-+------------------------+
++-----------------------------+
+|       AI Provider           |
+|      (OpenAI API)           |
++-----------------------------+
 ```
-### Design Note (v1)
+### Design Note (v2)
 
-* Do not modify request bodies
-* Minimize header mutation
-* No upstream HTTP status parsing
-* Stream everything. Streaming-first design (no buffering)
-* Metrics reflect connection success, not API-level success
-* Infra-level, not application-level. This is not a prompt router or model orchestrator.
+* Do not modify request bodies or prompts
+* Minimize header mutation (only required fields like Host)
+* Selectively parse upstream responses (only for /chat/completions)
+* Streaming-first design with selective buffering (for parsing and caching)
+* Metrics include both connection-level and token-level insights
+* Infra-level system — not a prompt router or model orchestrator
+* Caching and usage tracking are transparent to client applications
+
+### Scope
 
 ### Scope
 
@@ -152,24 +230,27 @@ This gateway is designed as an **infrastructure layer**, not an application-laye
 
 It does not:
 - modify prompts or responses
-- perform model selection
-- handle caching or cost tracking
+- perform model selection or orchestration
 
-Instead, it focuses on:
+It does provide:
+- response caching (transparent, prompt-based)
+- token-level usage tracking and cost calculation
+
+Its primary focus remains:
 - traffic control
 - security
 - reliability
 - observability
 
-This makes it a good foundation layer that can be combined with application-level tools such as LiteLLM or OpenRouter.
+This makes it a strong foundation layer that can be combined with application-level tools such as LiteLLM or OpenRouter.
 
 Example architecture:
 
 App → LiteLLM / OpenRouter → AI Gateway → AI Provider
 
 In this setup:
-- LiteLLM/OpenRouter handle model logic, caching, and cost tracking
-- AI Gateway handles authentication, rate limiting, routing, and logging
+- LiteLLM/OpenRouter handle model logic, advanced routing, and application-level policies
+- AI Gateway handles authentication, rate limiting, caching, usage tracking, routing, and logging
 
 ## Quick Start (Local)
 
@@ -284,7 +365,9 @@ Expected:
   curl -i http://127.0.0.1:8080/v1/models \
   -H "Authorization: Bearer YOUR_OPENAI_API_KEY" \
   -H "X-API-Key: user1" \
-  -H "X-User-Id: user42"
+  -H "X-User-Id: user42" \
+  -H "X-App-Id: support"
+
 ```
 (Replace YOUR_OPENAI_API_KEY with your actual key.)
   
@@ -294,13 +377,28 @@ Expected:
 
 - It might show error due to wrong api key. And you can see the error in ur logs. 
 
-👤 Note on User Tracking
+👤 User & Application Tracking
 
-In the examples above, X-User-Id is included to demonstrate per-user tracking.
-If not provided, the gateway will fall back to:
-<api_key>:<client_ip>
+The gateway supports both user-level and application-level tracking:
 
-For production usage, it is recommended to pass your application's user ID via X-User-Id.
+🔹 X-User-Id
+Represents the end user in your application.
+
+If not provided, it falls back to:
+```<api_key>:<client_ip>```
+
+🔹 X-App-Id
+
+Represents the application, service, or feature making the request.
+
+Example:
+
+- support → customer support chatbot
+- search → internal search assistant
+- analytics → reporting system
+
+If not provided, the gateway falls back to:
+```default```
 
 #### 6. Check metrics
 
@@ -312,7 +410,7 @@ Expected:
 
 - total requests, authentication results, rate limiting, and  upstream connectivity
 
-#### 7. Check usage stats
+#### 7. In-Memory Stats
 
 ```
 curl http://127.0.0.1:8080/stats | jq
@@ -322,17 +420,43 @@ curl http://127.0.0.1:8080/stats | jq
 Example Output
 ```
 {
-  "user1:127.0.0.1": {
+  "user1:127.0.0.1:support": {
     "/v1/chat/completions": {
       "requests": 37,
       "avg_latency_ms": 1606,
       "errors": 0,
       "error_rate": 0.0,
-      "estimated_total_cost": 0.0185
+      "cache hit rate": 10,
+      "token usage" : 1024,
+      "cost": 0.0024
     }
   }
 }
 ```
+
+#### 8. Database Stats
+
+Basic
+```
+curl http://127.0.0.1:8080/stats-db
+```
+
+Filter by user
+```
+curl "http://localhost:8080/stats-db?user=user1:127.0.0.1"
+```
+Time ranges
+```
+curl "http://localhost:8080/stats-db?range=24h"
+curl "http://localhost:8080/stats-db?range=7d"
+curl "http://localhost:8080/stats-db?range=all"
+```
+
+Combined filters
+```
+curl "http://localhost:8080/stats-db?user=user1:127.0.0.1&range=24h"
+```
+
 ## Using the Gateway
 
 The AI Gateway sits between your application and AI providers, giving you centralized control over traffic, security, and observability.
@@ -348,11 +472,12 @@ Example: Chatbot Startup
 
 A backend service sending requests to OpenAI can use the gateway to:
 
-* control API access across services
-* enforce rate limits per client or user
-* track usage and latency centrally
-* avoid exposing provider API keys everywhere
-* aggregate usage per user or route  
+* control API access across services  
+* enforce rate limits per client, user, or application  
+* track usage, latency, and token consumption centrally  
+* reduce cost using intelligent response caching  
+* avoid exposing provider API keys across services  
+* aggregate usage per user, route, and application  
 
 
 ### 1. Self-Hosted
@@ -370,6 +495,7 @@ A backend service sending requests to OpenAI can use the gateway to:
 
   - full control over configuration
   - local development and testing
+  - persistent caching and usage tracking via your database
   - no dependency on external services
 
 ### 2. Managed Gateway (Early Access)
@@ -387,10 +513,12 @@ dncsoftwarehelp@gmail.com
 * managed deployment
 * centralized configuration
 * usage tracking and observability
+* response caching for cost and latency optimization
 * controlled access and rate limiting
 
 **Notes**
 * designed for backend/service integration
+* supports multi-user and multi-application tracking
 * access is provisioned per team
 * usage policies may apply
 
@@ -413,63 +541,73 @@ http://your-gateway/v1
 
 Each request must include:
 
-* X-API-Key → gateway authentication
-* Authorization: Bearer <OPENAI_API_KEY> → upstream provider auth
-* X-User-Id → (optional) end-user identification
+* `X-API-Key` → gateway authentication  
+* `Authorization: Bearer <OPENAI_API_KEY>` → upstream provider auth  
 
-💡 **Important: Who sets `X-User-Id`?**
+Optional but recommended:
 
-The `X-User-Id` header is **not sent by end users or frontend apps**.
+* `X-User-Id` → end-user identification  
+* `X-App-Id` → application / service identification  
 
-It is typically added by your backend service using your own user system:
+#### 👤 User & Application Identification (Important)
 
-authenticated_user.id → X-User-Id → AI Gateway
+The gateway supports **multi-dimensional tracking** using:
 
-This allows the gateway to track usage per user without requiring any changes in client applications.
+- `X-User-Id` → identifies the end user  
+- `X-App-Id` → identifies the application or feature  
 
-**👤 User Identification (Important)**
+---
 
-The gateway supports per-user tracking using the X-User-Id header.
+**X-User-Id (User Tracking)**
 
-How it works
-* If X-User-Id is provided:
-  * stats are tracked per user
+Represents the end user in your system.
+
+How it works:
+
+* If provided:
+  * usage, latency, and cost are tracked per user  
 * If not provided:
   * gateway falls back to:
 
+``` id="int2"
 <api_key>:<client_ip>
+```
+**X-App-Id (Application Tracking)**
 
-How this is typically used
+Represents the application, service, or feature making the request.
 
-The X-User-Id header is set by your backend service, not by end users.
-Your backend should pass your internal user identifier (e.g. database user ID) to the gateway:
+Examples:
 
-```your_app_user_id → X-User-Id → AI Gateway```
+- support → customer support chatbot
+- search → internal assistant
+- analytics → reporting system
 
-This allows the gateway to track usage per user without requiring changes in client applications.
+How it works:
+
+-If provided:
+ - stats are tracked per application
+- If not provided:
+ - gateway falls back to:
+```default```
 
 Example:
 ```
 curl http://127.0.0.1:8080/v1/chat/completions \
   -H "Authorization: Bearer YOUR_OPENAI_API_KEY" \
   -H "X-API-Key: user1" \
-  -H "X-User-Id: user42"
+  -H "X-User-Id: user42" \
+  -H "X-App-Id: support"
 ```
 **Why this matters**
 
-Using X-User-Id enables:
+Using X-User-Id and X-App-Id enables:
 
 * per-user usage tracking
-* cost attribution per user
-* better observability
-* future per-user rate limiting  
+* per-application usage tracking
+* accurate cost attribution
+* better observability and debugging
+* foundation for future rate limiting and policies
 
-Recommended Pattern
-In your backend:
-  your_app_user_id → X-User-Id → AI Gateway
-
-Example:
-  user.id (database) → X-User-Id
 
 ### Example Integration
 
@@ -482,7 +620,8 @@ client = OpenAI(
     base_url="http://127.0.0.1:8080/v1",
     default_headers={
         "X-API-Key": "user1",
-        "X-User-Id": "user42"
+        "X-User-Id": "user42",
+        "X-App-Id": "support"
     }
 )
 ```
@@ -494,7 +633,8 @@ const client = new OpenAI({
   baseURL: "http://127.0.0.1:8080/v1",
   defaultHeaders: {
     "X-API-Key": "user1",
-    "X-User-Id": "user42"
+    "X-User-Id": "user42",
+    "X-App-Id": "support"
   }
 });
 ```
@@ -515,57 +655,8 @@ gateway_accepted 37
 upstream_success 35
 upstream_failures 2
 
-### Metric Definitions
 
-🌐 Traffic
-* requests_total
-  Total number of incoming requests (including bots and invalid requests)
-
-🔐 Authentication
-* auth_success
-  Requests with a valid API key
-* auth_failures
-  Requests rejected due to missing or invalid API key 
-
-🚦 Rate Limiting
-* rate_limited
-  Requests rejected due to rate limiting
-
-✅ Gateway Processing
-* gateway_accepted
-  Requests that passed authentication and rate limiting
-
-🔌 Upstream Connectivity
-* upstream_success
-  Requests where the connection to the upstream API succeeded and data was streamed
-* upstream_failures
-  Requests where the upstream connection failed (timeout, TLS error, connection failure)
-
-⚠️ Metrics Semantics (Important)
-* upstream_success and upstream_failures are connection-level metrics, not HTTP-level.
-* A request is considered successful if:
-  * the connection to the upstream API succeeds
-  * data is successfully streamed
-* This means:
-  * API-level errors (e.g. OpenAI returning 401/429/500) may still count as upstream_success
-* Full HTTP status-based metrics will be added in a future version.
-
-🧠 How to Interpret Metrics
-
-You can derive useful insights:
-* Bot traffic / noise
-  auth_failures / requests_total
-
-* Valid user traffic
-  auth_success
-
-* Accepted vs rejected requests
-  gateway_accepted vs rate_limited
-
-* Upstream health (connection-level)
-  upstream_failures vs upstream_success
-
-## Stats
+## In Memory Stats
 
 Stats endpoint:  
 
@@ -576,63 +667,20 @@ Example Output:
 {
   "user1:127.0.0.1": {
     "/v1/chat/completions": {
-      "requests": 37,
-      "avg_latency_ms": 1606,
-      "errors": 0,
-      "error_rate": 0.0,
-      "estimated_total_cost": 0.0185
+      "gpt-4o-mini": {
+        "requests": 37,
+        "avg_latency_ms": 1606,
+        "errors": 0,
+        "error_rate": 0.0,
+        "cache_hits": 12,
+        "cache_hit_rate": 0.32,
+        "total_tokens": 1040,
+        "total_cost": 0.0185
+      }
     }
   }
 }
-
-### Stats Definitions
-
-👤 User Scope
-* Stats are grouped by:
-  * user_id (if provided via X-User-Id)
-  * fallback: api_key:ip
-
-🛣️ Route Scope
-Each user contains per-route metrics:
-* /v1/chat/completions
-* /test
- etc.
-
-📈 Aggregated Fields
-* requests
-  Number of requests accepted by the gateway (after auth + rate limiting)
-* avg_latency_ms
-  Average upstream latency per route
-* errors
-  Number of upstream connection-level failures
-* error_rate
-  errors / requests
-* estimated_total_cost
-  Approximate cost based on model defaults
-
-⚠️ Stats Semantics (Important)
-* Stats are updated after requests pass authentication and rate      limiting
-* Errors are connection-level, not HTTP-level:
-  * API errors (401, 429, etc.) may not count as errors
-* Cost estimation is:
-  * approximate
-  * based on static model pricing
-  * not token-accurate
-
-🧠 How to Interpret Stats
-
-You can derive useful insights:
-* Per-user usage
-  requests per user
-
-* Performance monitoring
-  avg_latency_ms per route
-
-* Reliability (connection-level)
-  error_rate
-
-* Cost tracking (approximate)
-  estimated_total_cost    
+    
 
 ## Benchmark
 
@@ -652,47 +700,80 @@ Requests/sec: ~60,000
 
 ---
 
-## ⚠️ Current Limitations (v1)
+## ⚠️ Current Limitations (v2)
 
-* Connection-level proxying only
-  * Does not parse upstream HTTP status codes
-  * API-level errors (401, 429, 500) are not reflected in metrics
+* Partial HTTP-aware proxying
+  * Selectively parses responses (for token usage and model extraction)
+  * Full upstream status code handling is not yet integrated into metrics
+
 * Retry is connection-level only
   * Does not retry full requests
   * No idempotency awareness
-* No request caching
+
+* Basic caching implementation
+  * No TTL (time-based expiration)
+  * No cache invalidation
+  * Cache key does not include all parameters (e.g. temperature, top_p)
+
 * No model-level routing
-  * Routing is path-based only
+  * Routing is still path-based only
+
 * No circuit breaker
   * Failing upstreams are retried but not dynamically isolated beyond basic health checks
 
+* Limited streaming support
+  * Streaming responses are not fully supported when parsing is enabled
+  * Current design favors full-response processing (for caching and token extraction)
+
+* No request deduplication (in-flight)
+  * Identical concurrent requests are not coalesced
+
 ## 🚀 Future Improvements
-* HTTP-aware proxying
+* Full HTTP-aware proxying
   * Upstream status code parsing
   * Accurate success/failure metrics
+
 * Full request retry
   * Idempotent-safe retry logic
-* Config-driven routing
-  * YAML/JSON-based configuration
+
+* Advanced caching layer
+  * TTL-based expiration
+  * Parameter-aware cache keys
+  * Cache invalidation strategies
+  * In-flight request deduplication
+
+* Model-aware routing
+  * Route based on model, cost, or policy
+
 * Circuit breaker
   * Automatic isolation of failing upstreams
-* Request caching layer
+
+* Streaming support (true passthrough mode)
+  * Optional mode to bypass parsing for real-time streaming use cases
+
+* Config-driven routing
+  * YAML/JSON-based configuration
+
 * Containerization
   * Docker support
+
 * CLI interface
   * Easier local management and configuration
+
 * Dashboard
+  * Visualization of usage, cost, and performance
 
 
 ## License
 
-Personal project
+Free for personal use
+Commercial use requires permission
 
 ## 💬 Early Access / Setup Help
 
-If you're using AI APIs and want help setting up the gateway (auth, rate limiting, logging) for your app, feel free to reach out.
+If you're building with AI APIs and want help integrating the gateway (auth, rate limiting, caching, usage tracking), feel free to reach out.
 
-I'm open to helping early users get started and would love feedback from real use cases.
+I'm open to helping early users get started and would love feedback from real-world use cases.
 
 Contact: dncsoftwarehelp@gmail.com
 
