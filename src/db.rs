@@ -63,3 +63,47 @@ pub async fn insert_cache_hit(
         ],
     ).await;
 }
+
+pub async fn username_exists(
+    client: &Client,
+    username: &str,
+    app_id: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM users
+                WHERE username = $1
+                  AND app_id = $2
+            )
+            "#,
+            &[&username, &app_id],
+        )
+        .await?;
+
+    Ok(row.get(0))
+}
+
+
+pub async fn create_user(
+    client: &Client,
+    username: &str,
+    app_id: &str,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            r#"
+            INSERT INTO users (
+                username,
+                app_id
+            )
+            VALUES ($1, $2)
+            "#,
+            &[&username, &app_id],
+        )
+        .await?;
+
+    Ok(())
+}

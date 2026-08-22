@@ -38,6 +38,12 @@ struct UserStats {
     total_tokens: u64,
 }
 
+#[derive(Deserialize)]
+struct RegisterUserRequest {
+    username: String,
+    app_id: String,
+}
+
 mod metrics;
 mod rate_limiter;
 mod load_balancer;
@@ -65,6 +71,7 @@ type UsageMap = Arc<
 >;
 
 use serde_json::json;
+use serde::Deserialize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -693,6 +700,172 @@ async fn handle_client(
 
         let _ = client.write_all(response.as_bytes()).await;
         return;
+    }
+
+    // ---- STEP 3.2: Handle user registration ----
+    if req.path == "/users/register" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid HTTP request",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let already_read = buffer.len() - header_end;
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+
+            let mut body = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body).await {
+                eprintln!("Failed to read registration body: {}", e);
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid request body",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body);
+        }
+
+        let body = &buffer[header_end..header_end + content_length];
+
+        let payload =
+            match serde_json::from_slice::<RegisterUserRequest>(body) {
+                Ok(payload) => payload,
+
+                Err(e) => {
+                    eprintln!("Invalid registration JSON: {}", e);
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        "Invalid JSON",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let username = payload.username.trim();
+        let app_id = payload.app_id.trim();
+
+        if username.is_empty() || app_id.is_empty() {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Username and app_id are required",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        match db::username_exists(
+            &db_client,
+            username,
+            app_id,
+        )
+        .await
+        {
+            Ok(true) => {
+                send_response(
+                    &mut client,
+                    "409 Conflict",
+                    "Username already taken",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Ok(false) => {}
+
+            Err(e) => {
+                eprintln!("Username check failed: {}", e);
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        }
+
+        match db::create_user(
+            &db_client,
+            username,
+            app_id,
+        )
+        .await
+        {
+            Ok(_) => {
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    "User registered",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!("User creation failed: {}", e);
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        }
     }
 
     // ---- STEP 4: API Key Authentication ----
