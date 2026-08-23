@@ -438,7 +438,6 @@ async fn handle_client(
     let upstream_status_code: u16;
     let upstream_latency_ms: u128;
 
-    let DAILY_LIMIT: f64 = 0.01; // example: $0.01
 
     info!(
     request_id = %request_id,
@@ -970,36 +969,6 @@ async fn handle_client(
     }
     GATEWAY_ACCEPTED.fetch_add(1, Ordering::Relaxed);
 
-    // ---- STEP 5.5: Enforce daily cost limit ----
-
-    let rows = db_client.query(
-        "SELECT COALESCE(SUM(cost), 0)
-        FROM usage_logs
-        WHERE user_id = $1
-        AND created_at > NOW() - INTERVAL '1 day'",
-        &[&user_id]
-    ).await;
-
-    let current_cost: f64 = match rows {
-        Ok(r) => {
-            let val: f64 = r[0].get(0);
-            val
-        }
-        Err(_) => 0.0,
-    };
-
-    if current_cost >= DAILY_LIMIT {
-        let body = format!("Daily limit exceeded. Used: ${:.6}", current_cost);
-
-        let response = format!(
-            "HTTP/1.1 429 Too Many Requests\r\nContent-Length: {}\r\n\r\n{}",
-            body.len(),
-            body
-        );
-
-        let _ = client.write_all(response.as_bytes()).await;
-        return;
-    }
 
     // ---- STEP 6: Route request to upstream ----
     let upstream_addr = {
@@ -1246,6 +1215,87 @@ async fn handle_client(
             }
         }
     }
+
+    // ============================================================
+    // ---- STEP 10.5: Enforce monthly AI call limit
+    // ============================================================
+
+    let (plan, monthly_limit) =
+        match db::get_user_plan(
+            &db_client,
+            &user_id,
+        ).await {
+            Ok(result) => result,
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to get user plan: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Unable to check account limits",
+                    &request_id,
+                    start,
+                ).await;
+
+                return;
+            }
+        };
+
+    let monthly_calls =
+        match db::get_monthly_ai_calls(
+            &db_client,
+            &user_id,
+        ).await {
+            Ok(count) => count,
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to get monthly AI calls: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Unable to check usage",
+                    &request_id,
+                    start,
+                ).await;
+
+                return;
+            }
+        };
+
+    info!(
+        user_id = %user_id,
+        plan = %plan,
+        monthly_calls = %monthly_calls,
+        monthly_limit = %monthly_limit,
+        "monthly_usage_check"
+    );
+
+    if monthly_calls >= monthly_limit {
+        let body = format!(
+            "Monthly AI call limit reached. Used: {}/{}",
+            monthly_calls,
+            monthly_limit
+        );
+
+        send_response(
+            &mut client,
+            "429 Too Many Requests",
+            &body,
+            &request_id,
+            start,
+        ).await;
+
+        return;
+    }
+
     // ============================================================
     // ---- STEP 11: Forward request to upstream (OpenAI)
     // ============================================================

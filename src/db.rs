@@ -97,13 +97,59 @@ pub async fn create_user(
             r#"
             INSERT INTO users (
                 username,
-                app_id
+                app_id,
+                plan,
+                monthly_limit
             )
-            VALUES ($1, $2)
+            VALUES ($1, $2, 'free', 100)
             "#,
             &[&username, &app_id],
         )
         .await?;
 
     Ok(())
+}
+
+pub async fn get_user_plan(
+    client: &Client,
+    user_id: &str,
+) -> Result<(String, i64), tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT plan, monthly_limit
+            FROM users
+            WHERE username = split_part($1, ':', 1)
+              AND app_id = split_part($1, ':', 2)
+            "#,
+            &[&user_id],
+        )
+        .await?;
+
+    let plan: String = row.get("plan");
+    let monthly_limit: i64 = row.get("monthly_limit");
+
+    Ok((plan, monthly_limit))
+}
+
+pub async fn get_monthly_ai_calls(
+    client: &Client,
+    user_id: &str,
+) -> Result<i64, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT COUNT(*)
+            FROM usage_logs
+            WHERE user_id = $1
+              AND created_at >= date_trunc('month', NOW())
+              AND total_tokens > 0
+            "#,
+            &[&user_id],
+        )
+        .await?;
+
+    let count: i64 = row.get(0);
+
+    Ok(count)
 }
