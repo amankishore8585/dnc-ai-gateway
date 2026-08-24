@@ -866,6 +866,87 @@ async fn handle_client(
             }
         }
     }
+    
+    // ---- STEP 3.3: Get user plan ----
+    if req.path == "/users/plan" && req.method == "GET" {
+
+        let username = match req.headers.get("X-User-Id") {
+            Some(username) if !username.trim().is_empty() => username.trim(),
+            _ => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Missing X-User-Id",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let app_id = match req.headers.get("X-App-Id") {
+            Some(app_id) if !app_id.trim().is_empty() => app_id.trim(),
+            _ => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Missing X-App-Id",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let user_id = format!("{}:{}", username, app_id);
+
+        match db::get_user_plan(
+            &db_client,
+            &user_id,
+        )
+        .await
+        {
+            Ok((plan, monthly_limit)) => {
+
+                let body = serde_json::json!({
+                    "plan": plan,
+                    "monthly_limit": monthly_limit
+                })
+                .to_string();
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    &body,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to get user plan: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "404 Not Found",
+                    "User not found",
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+        }
+
+        return;
+    }
 
     // ---- STEP 4: API Key Authentication ----
 
