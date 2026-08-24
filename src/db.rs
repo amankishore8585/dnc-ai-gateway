@@ -2,9 +2,12 @@ use tokio_postgres::{NoTls, Client};
 
 pub async fn connect_db() -> Client {
     let (client, connection) =
-        tokio_postgres::connect("host=localhost user=gateway_user password=strongpassword dbname=ai_gateway", NoTls)
-            .await
-            .expect("Failed to connect to DB");
+        tokio_postgres::connect(
+            "host=localhost user=gateway_user password=strongpassword dbname=ai_gateway",
+            NoTls,
+        )
+        .await
+        .expect("Failed to connect to DB");
 
     // spawn connection handler
     tokio::spawn(async move {
@@ -86,7 +89,6 @@ pub async fn username_exists(
     Ok(row.get(0))
 }
 
-
 pub async fn create_user(
     client: &Client,
     username: &str,
@@ -113,7 +115,7 @@ pub async fn create_user(
 pub async fn get_user_plan(
     client: &Client,
     user_id: &str,
-) -> Result<(String, i64), tokio_postgres::Error> {
+) -> Result<(String, i32), tokio_postgres::Error> {
     let row = client
         .query_one(
             r#"
@@ -127,7 +129,7 @@ pub async fn get_user_plan(
         .await?;
 
     let plan: String = row.get("plan");
-    let monthly_limit: i64 = row.get("monthly_limit");
+    let monthly_limit: i32 = row.get("monthly_limit");
 
     Ok((plan, monthly_limit))
 }

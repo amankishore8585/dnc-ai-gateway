@@ -1278,7 +1278,7 @@ async fn handle_client(
         "monthly_usage_check"
     );
 
-    if monthly_calls >= monthly_limit {
+    if monthly_calls >= monthly_limit as i64 {
         let body = serde_json::json!({
             "error": "monthly_limit_reached",
             "plan": plan,
