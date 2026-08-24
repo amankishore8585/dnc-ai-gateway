@@ -1279,11 +1279,13 @@ async fn handle_client(
     );
 
     if monthly_calls >= monthly_limit {
-        let body = format!(
-            "Monthly AI call limit reached. Used: {}/{}",
-            monthly_calls,
-            monthly_limit
-        );
+        let body = serde_json::json!({
+            "error": "monthly_limit_reached",
+            "plan": plan,
+            "used": monthly_calls,
+            "limit": monthly_limit
+        })
+        .to_string();
 
         send_response(
             &mut client,
