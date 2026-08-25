@@ -31,22 +31,24 @@ pub async fn insert_usage(
     latency_ms: i64,
     status_code: i32,
 ) {
-    let _ = client.execute(
-        "INSERT INTO usage_logs 
-        (user_id, route, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, status_code)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-        &[
-            &user_id,
-            &route,
-            &model,
-            &prompt_tokens,
-            &completion_tokens,
-            &total_tokens,
-            &cost,
-            &latency_ms,
-            &status_code,
-        ],
-    ).await;
+    let _ = client
+        .execute(
+            "INSERT INTO usage_logs
+            (user_id, route, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, status_code)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+            &[
+                &user_id,
+                &route,
+                &model,
+                &prompt_tokens,
+                &completion_tokens,
+                &total_tokens,
+                &cost,
+                &latency_ms,
+                &status_code,
+            ],
+        )
+        .await;
 }
 
 pub async fn insert_cache_hit(
@@ -55,16 +57,18 @@ pub async fn insert_cache_hit(
     route: &str,
     model: &str,
 ) {
-    let _ = client.execute(
-        "INSERT INTO usage_logs 
-        (user_id, route, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, status_code)
-        VALUES ($1,$2,$3,0,0,0,0,0,200)",
-        &[
-            &user_id,
-            &route,
-            &model,
-        ],
-    ).await;
+    let _ = client
+        .execute(
+            "INSERT INTO usage_logs
+            (user_id, route, model, prompt_tokens, completion_tokens, total_tokens, cost, latency_ms, status_code)
+            VALUES ($1,$2,$3,0,0,0,0,0,200)",
+            &[
+                &user_id,
+                &route,
+                &model,
+            ],
+        )
+        .await;
 }
 
 pub async fn username_exists(
@@ -196,7 +200,6 @@ pub async fn activate_premium(
     amount: i64,
     currency: &str,
 ) -> Result<bool, tokio_postgres::Error> {
-
     let updated = client
         .execute(
             r#"
@@ -205,12 +208,11 @@ pub async fn activate_premium(
                 plan = 'premium',
                 monthly_limit = 1000,
                 premium_expires_at = NOW() + INTERVAL '30 days',
-                payment_type = 'one_time',
-                subscription_id = $3
+                payment_type = 'one_time'
             WHERE username = $1
               AND app_id = $2
             "#,
-            &[&user_id, &app_id, &order_id],
+            &[&user_id, &app_id],
         )
         .await?;
 
