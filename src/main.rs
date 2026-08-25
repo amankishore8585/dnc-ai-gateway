@@ -972,6 +972,314 @@ async fn handle_client(
         return;
     }
 
+    // ------------------------------------------------------------
+    // Verify Razorpay payment
+    // ------------------------------------------------------------
+    if req.path == "/payments/verify" && req.method == "POST" {
+
+        let user_id = match req.headers.get("X-User-Id") {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+
+            _ => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Missing X-User-Id"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // Read Content-Length
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        // Find end of HTTP headers
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid HTTP request"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // Read remaining body if it wasn't already read
+        let already_read =
+            buffer.len().saturating_sub(header_end);
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) =
+                client.read_exact(&mut body_buf).await
+            {
+                eprintln!(
+                    "Failed to read payment verification body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid request body"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body_bytes =
+            &buffer[header_end..header_end + content_length];
+
+        let body: serde_json::Value =
+            match serde_json::from_slice(body_bytes) {
+
+                Ok(v) => v,
+
+                Err(_) => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Invalid JSON"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Extract Razorpay values
+        let order_id =
+            match body
+                .get("razorpay_order_id")
+                .and_then(|v| v.as_str())
+            {
+                Some(v) => v,
+
+                None => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Missing razorpay_order_id"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let payment_id =
+            match body
+                .get("razorpay_payment_id")
+                .and_then(|v| v.as_str())
+            {
+                Some(v) => v,
+
+                None => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Missing razorpay_payment_id"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let signature =
+            match body
+                .get("razorpay_signature")
+                .and_then(|v| v.as_str())
+            {
+                Some(v) => v,
+
+                None => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Missing razorpay_signature"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Check whether this payment was already processed
+        match db::payment_exists(
+            &db_client,
+            payment_id,
+        )
+        .await
+        {
+            Ok(true) => {
+                send_response(
+                    &mut client,
+                    "409 Conflict",
+                    r#"{"error":"Payment already processed"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Ok(false) => {}
+
+            Err(e) => {
+                eprintln!(
+                    "Payment lookup failed: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Database error"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        }
+
+        // Razorpay verification is handled by payments.rs
+        let razorpay_client =
+            reqwest::Client::new();
+
+        match payments::verify_payment(
+            &razorpay_client,
+            &razorpay_key_id,
+            &razorpay_key_secret,
+            &user_id,
+            order_id,
+            payment_id,
+            signature,
+        )
+        .await
+        {
+            Ok(()) => {}
+
+            Err(e) => {
+                eprintln!(
+                    "Razorpay payment verification failed: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    &serde_json::json!({
+                        "error": e
+                    }).to_string(),
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        }
+
+        // Activate Premium and record payment
+        match db::activate_premium(
+            &db_client,
+            &user_id,
+            order_id,
+            payment_id,
+            12900,
+            "INR",
+        )
+        .await
+        {
+            Ok(true) => {
+                println!(
+                    "Premium activated: user={} order={} payment={}",
+                    user_id,
+                    order_id,
+                    payment_id
+                );
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true,"plan":"premium","monthly_limit":1000}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Ok(false) => {
+                send_response(
+                    &mut client,
+                    "404 Not Found",
+                    r#"{"error":"User not found"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to activate Premium: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Failed to activate Premium"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+        }
+
+        return;
+    }
+
+
+
     // ---- STEP 3.3: Get user plan ----
     if req.path == "/users/plan" && req.method == "GET" {
 
