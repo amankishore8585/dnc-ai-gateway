@@ -55,6 +55,7 @@ use rate_limiter::{RateLimiter, TokenBucket};
 use load_balancer::LoadBalancer;
 use config::{ApiKeys, load_api_keys};
 use crate::db::connect_db;
+use std::env;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -93,6 +94,9 @@ trait IoStream: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 
 type Balancers = Arc<Mutex<HashMap<String, LoadBalancer>>>;
+
+
+
 
 
 // ------------------------------------------------------------
@@ -428,8 +432,10 @@ async fn handle_client(
     balancers: Balancers,
     api_keys: ApiKeys,
     usage_map: UsageMap,
-    db_client: Arc<tokio_postgres::Client>
-    ){
+    db_client: Arc<tokio_postgres::Client>,
+    razorpay_key_id: String,
+    razorpay_key_secret: String,
+) {
     use uuid::Uuid;
 
     let request_id = Uuid::new_v4().to_string();
@@ -867,6 +873,145 @@ async fn handle_client(
         }
     }
     
+    if req.path == "/payments/create-order" && req.method == "POST" {
+        let user_id = match req.headers.get("X-User-Id") {
+            Some(v) => v.clone(),
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Missing X-User-Id"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let app_id = match req.headers.get("X-App-Id") {
+            Some(v) => v.clone(),
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Missing X-App-Id"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+                return;
+            }
+        };
+
+        if app_id != "money_assistant" {
+            send_response(
+                &mut client,
+                "403 Forbidden",
+                r#"{"error":"Invalid app"}"#,
+                &request_id,
+                start,
+            )
+            .await;
+            return;
+        }
+
+        let amount = 12900i64;
+
+        let razorpay_client = reqwest::Client::new();
+
+        let response = match razorpay_client
+            .post("https://api.razorpay.com/v1/orders")
+            .basic_auth(
+                &razorpay_key_id,
+                Some(&razorpay_key_secret),
+            )
+            .json(&serde_json::json!({
+                "amount": amount,
+                "currency": "INR",
+                "receipt": format!(
+                    "{}-{}",
+                    user_id,
+                    uuid::Uuid::new_v4()
+                ),
+                "notes": {
+                    "user_id": user_id,
+                    "app_id": app_id,
+                    "plan": "premium",
+                    "payment_type": "one_time"
+                }
+            }))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => {
+                eprintln!("Razorpay order request failed: {}", e);
+
+                send_response(
+                    &mut client,
+                    "502 Bad Gateway",
+                    r#"{"error":"Could not connect to Razorpay"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+                return;
+            }
+        };
+
+        let status = response.status();
+
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(e) => {
+                eprintln!("Failed reading Razorpay response: {}", e);
+
+                send_response(
+                    &mut client,
+                    "502 Bad Gateway",
+                    r#"{"error":"Invalid Razorpay response"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+                return;
+            }
+        };
+
+        if !status.is_success() {
+            eprintln!(
+                "Razorpay order creation failed: {} {}",
+                status,
+                body
+            );
+
+            send_response(
+                &mut client,
+                "502 Bad Gateway",
+                &body,
+                &request_id,
+                start,
+            )
+            .await;
+            return;
+        }
+
+        send_response(
+            &mut client,
+            "200 OK",
+            &body,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
+
+
+
     // ---- STEP 3.3: Get user plan ----
     if req.path == "/users/plan" && req.method == "GET" {
 
@@ -1838,6 +1983,15 @@ async fn health_checker(balancers: Balancers) {
 #[tokio::main]
 async fn main() {
     init_logging();
+
+    let razorpay_key_id =
+        env::var("RAZORPAY_KEY_ID")
+            .expect("RAZORPAY_KEY_ID not set");
+
+    let razorpay_key_secret =
+        env::var("RAZORPAY_KEY_SECRET")
+            .expect("RAZORPAY_KEY_SECRET not set");
+
     let usage_map: UsageMap = Arc::new(Mutex::new(HashMap::new()));
 
     let api_keys = load_api_keys();
@@ -1897,12 +2051,23 @@ async fn main() {
                     let limiter = limiter.clone();
                     let balancers = balancers.clone();
                     let usage_map = usage_map.clone();
-                    let db_client = db_client.clone(); 
+                    let db_client = db_client.clone();
+
+                    let razorpay_key_id = razorpay_key_id.clone();
+                    let razorpay_key_secret = razorpay_key_secret.clone();
 
                     async move {
-                        handle_client(stream, limiter, balancers, api_keys, usage_map, db_client).await;
+                        handle_client(
+                            stream,
+                            limiter,
+                            balancers,
+                            api_keys,
+                            usage_map,
+                            db_client,
+                            razorpay_key_id,
+                            razorpay_key_secret,
+                        ).await;
                     }
-
                 });
             }
             Err(e) => eprintln!("connection error: {}", e),
