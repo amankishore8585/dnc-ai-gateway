@@ -220,6 +220,15 @@ pub async fn activate_premium(
         return Ok(false);
     }
 
+    println!(
+        "PAYMENT INSERT DEBUG: user_id={:?}, order_id={:?}, payment_id={:?}, amount={}, currency={:?}",
+        user_id,
+        order_id,
+        payment_id,
+        amount,
+        currency
+    );
+
     client
         .execute(
             r#"
