@@ -49,6 +49,7 @@ mod rate_limiter;
 mod load_balancer;
 mod config;
 mod db;
+mod payments;
 
 use metrics::*;
 use rate_limiter::{RateLimiter, TokenBucket};
@@ -872,11 +873,16 @@ async fn handle_client(
             }
         }
     }
-    
+
+    // ------------------------------------------------------------
+    // Create Razorpay order
+    // ------------------------------------------------------------
     if req.path == "/payments/create-order" && req.method == "POST" {
+
         let user_id = match req.headers.get("X-User-Id") {
-            Some(v) => v.clone(),
-            None => {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+
+            _ => {
                 send_response(
                     &mut client,
                     "400 Bad Request",
@@ -885,13 +891,15 @@ async fn handle_client(
                     start,
                 )
                 .await;
+
                 return;
             }
         };
 
         let app_id = match req.headers.get("X-App-Id") {
-            Some(v) => v.clone(),
-            None => {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+
+            _ => {
                 send_response(
                     &mut client,
                     "400 Bad Request",
@@ -900,6 +908,7 @@ async fn handle_client(
                     start,
                 )
                 .await;
+
                 return;
             }
         };
@@ -913,104 +922,55 @@ async fn handle_client(
                 start,
             )
             .await;
+
             return;
         }
-
-        let amount = 12900i64;
 
         let razorpay_client = reqwest::Client::new();
 
-        let response = match razorpay_client
-            .post("https://api.razorpay.com/v1/orders")
-            .basic_auth(
-                &razorpay_key_id,
-                Some(&razorpay_key_secret),
-            )
-            .json(&serde_json::json!({
-                "amount": amount,
-                "currency": "INR",
-                "receipt": format!(
-                    "{}-{}",
-                    user_id,
-                    uuid::Uuid::new_v4()
-                ),
-                "notes": {
-                    "user_id": user_id,
-                    "app_id": app_id,
-                    "plan": "premium",
-                    "payment_type": "one_time"
-                }
-            }))
-            .send()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                eprintln!("Razorpay order request failed: {}", e);
-
-                send_response(
-                    &mut client,
-                    "502 Bad Gateway",
-                    r#"{"error":"Could not connect to Razorpay"}"#,
-                    &request_id,
-                    start,
-                )
-                .await;
-                return;
-            }
-        };
-
-        let status = response.status();
-
-        let body = match response.text().await {
-            Ok(body) => body,
-            Err(e) => {
-                eprintln!("Failed reading Razorpay response: {}", e);
-
-                send_response(
-                    &mut client,
-                    "502 Bad Gateway",
-                    r#"{"error":"Invalid Razorpay response"}"#,
-                    &request_id,
-                    start,
-                )
-                .await;
-                return;
-            }
-        };
-
-        if !status.is_success() {
-            eprintln!(
-                "Razorpay order creation failed: {} {}",
-                status,
-                body
-            );
-
-            send_response(
-                &mut client,
-                "502 Bad Gateway",
-                &body,
-                &request_id,
-                start,
-            )
-            .await;
-            return;
-        }
-
-        send_response(
-            &mut client,
-            "200 OK",
-            &body,
-            &request_id,
-            start,
+        match payments::create_order(
+            &razorpay_client,
+            &razorpay_key_id,
+            &razorpay_key_secret,
+            &user_id,
+            &app_id,
         )
-        .await;
+        .await
+        {
+            Ok(order) => {
+
+                let body = order.to_string();
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    &body,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Err(e) => {
+
+                eprintln!(
+                    "Razorpay order creation failed: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "502 Bad Gateway",
+                    &e,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+        }
 
         return;
     }
-
-
-
 
     // ---- STEP 3.3: Get user plan ----
     if req.path == "/users/plan" && req.method == "GET" {
