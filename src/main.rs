@@ -1222,6 +1222,7 @@ async fn handle_client(
         match db::activate_premium(
             &db_client,
             &user_id,
+            "money_assistant",
             order_id,
             payment_id,
             12900,

@@ -190,6 +190,7 @@ pub async fn payment_exists(
 pub async fn activate_premium(
     client: &tokio_postgres::Client,
     user_id: &str,
+    app_id: &str,
     order_id: &str,
     payment_id: &str,
     amount: i64,
@@ -205,11 +206,11 @@ pub async fn activate_premium(
                 monthly_limit = 1000,
                 premium_expires_at = NOW() + INTERVAL '30 days',
                 payment_type = 'one_time',
-                subscription_id = $2
-            WHERE username = split_part($1, ':', 1)
-              AND app_id = split_part($1, ':', 2)
+                subscription_id = $3
+            WHERE username = $1
+              AND app_id = $2
             "#,
-            &[&user_id, &order_id],
+            &[&user_id, &app_id, &order_id],
         )
         .await?;
 
