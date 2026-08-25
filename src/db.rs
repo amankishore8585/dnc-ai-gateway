@@ -197,7 +197,7 @@ pub async fn activate_premium(
     app_id: &str,
     order_id: &str,
     payment_id: &str,
-    amount: i64,
+    amount: i32,
     currency: &str,
 ) -> Result<bool, tokio_postgres::Error> {
     let updated = client
