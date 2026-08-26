@@ -1744,13 +1744,9 @@ async fn handle_client(
     // FREE PLAN
     // ------------------------------------------------------------
     // Free is the one-time trial.
-    // It uses lifetime AI calls so the user cannot get
-    // another 100 calls by simply waiting for a new month.
     //
-    // Example:
-    //   limit = 100
-    //   lifetime calls = 100
-    //   → blocked permanently
+    // Once the lifetime AI limit is reached, the user is
+    // permanently moved to the manual plan.
     // ------------------------------------------------------------
 
     if plan == "free" {
@@ -1790,17 +1786,45 @@ async fn handle_client(
 
         if lifetime_calls >= limit as i64 {
 
+            match db::set_user_manual(
+                &db_client,
+                &user_id,
+            ).await {
+                Ok(true) => {
+                    info!(
+                        user_id = %user_id,
+                        "free_limit_reached_user_moved_to_manual"
+                    );
+                }
+
+                Ok(false) => {
+                    eprintln!(
+                        "Failed to move user={} to manual: user not found",
+                        user_id
+                    );
+                }
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to move user={} to manual: {}",
+                        user_id,
+                        e
+                    );
+                }
+            }
+
             let body = serde_json::json!({
-                "error": "trial_limit_reached",
-                "plan": "free",
+                "error": "manual_plan",
+                "plan": "manual",
                 "used": lifetime_calls,
-                "limit": limit
+                "limit": limit,
+                "message": "AI access is unavailable on the manual plan"
             })
             .to_string();
 
             send_response(
                 &mut client,
-                "429 Too Many Requests",
+                "403 Forbidden",
                 &body,
                 &request_id,
                 start,
@@ -1813,9 +1837,10 @@ async fn handle_client(
     // ------------------------------------------------------------
     // PREMIUM PLAN
     // ------------------------------------------------------------
-    // Premium gets a monthly limit.
-    // The counter resets automatically each month because
-    // get_monthly_ai_calls() only counts the current month.
+    // Premium gets a monthly AI limit.
+    //
+    // Once the monthly limit is reached, the user is moved
+    // to the manual plan.
     // ------------------------------------------------------------
 
     else if plan == "premium" {
@@ -1855,17 +1880,45 @@ async fn handle_client(
 
         if monthly_calls >= limit as i64 {
 
+            match db::set_user_manual(
+                &db_client,
+                &user_id,
+            ).await {
+                Ok(true) => {
+                    info!(
+                        user_id = %user_id,
+                        "premium_monthly_limit_reached_user_moved_to_manual"
+                    );
+                }
+
+                Ok(false) => {
+                    eprintln!(
+                        "Failed to move user={} to manual: user not found",
+                        user_id
+                    );
+                }
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to move user={} to manual: {}",
+                        user_id,
+                        e
+                    );
+                }
+            }
+
             let body = serde_json::json!({
-                "error": "monthly_limit_reached",
-                "plan": "premium",
+                "error": "manual_plan",
+                "plan": "manual",
                 "used": monthly_calls,
-                "limit": limit
+                "limit": limit,
+                "message": "AI access is unavailable on the manual plan"
             })
             .to_string();
 
             send_response(
                 &mut client,
-                "429 Too Many Requests",
+                "403 Forbidden",
                 &body,
                 &request_id,
                 start,
@@ -1878,9 +1931,9 @@ async fn handle_client(
     // ------------------------------------------------------------
     // MANUAL PLAN
     // ------------------------------------------------------------
-    // Premium has expired.
-    // Manual transactions will be handled separately.
-    // For now, no AI access.
+    // No AI access.
+    // Notifications should be skipped by the Flutter app
+    // before they reach the AI extractor.
     // ------------------------------------------------------------
 
     else if plan == "manual" {

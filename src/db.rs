@@ -208,6 +208,27 @@ pub async fn get_lifetime_ai_calls(
     Ok(count)
 }
 
+pub async fn set_user_manual(
+    client: &Client,
+    user_id: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let updated = client
+        .execute(
+            r#"
+            UPDATE users
+            SET
+                plan = 'manual',
+                monthly_limit = 0
+            WHERE username = split_part($1, ':', 1)
+              AND app_id = split_part($1, ':', 2)
+            "#,
+            &[&user_id],
+        )
+        .await?;
+
+    Ok(updated > 0)
+}
+
 pub async fn payment_exists(
     client: &tokio_postgres::Client,
     payment_id: &str,
