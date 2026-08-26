@@ -1712,10 +1712,10 @@ async fn handle_client(
     }
 
     // ============================================================
-    // ---- STEP 10.5: Enforce monthly AI call limit
+    // ---- STEP 10.5: Enforce AI call limits
     // ============================================================
 
-    let (plan, monthly_limit) =
+    let (plan, limit) =
         match db::get_user_plan(
             &db_client,
             &user_id,
@@ -1740,51 +1740,161 @@ async fn handle_client(
             }
         };
 
-    let monthly_calls =
-        match db::get_monthly_ai_calls(
-            &db_client,
-            &user_id,
-        ).await {
-            Ok(count) => count,
+    // ------------------------------------------------------------
+    // FREE PLAN
+    // ------------------------------------------------------------
+    // Free is the one-time trial.
+    // It uses lifetime AI calls so the user cannot get
+    // another 100 calls by simply waiting for a new month.
+    //
+    // Example:
+    //   limit = 100
+    //   lifetime calls = 100
+    //   → blocked permanently
+    // ------------------------------------------------------------
 
-            Err(e) => {
-                eprintln!(
-                    "Failed to get monthly AI calls: {}",
-                    e
-                );
+    if plan == "free" {
 
-                send_response(
-                    &mut client,
-                    "500 Internal Server Error",
-                    "Unable to check usage",
-                    &request_id,
-                    start,
-                ).await;
+        let lifetime_calls =
+            match db::get_lifetime_ai_calls(
+                &db_client,
+                &user_id,
+            ).await {
+                Ok(count) => count,
 
-                return;
-            }
-        };
+                Err(e) => {
+                    eprintln!(
+                        "Failed to get lifetime AI calls: {}",
+                        e
+                    );
 
-    info!(
-        user_id = %user_id,
-        plan = %plan,
-        monthly_calls = %monthly_calls,
-        monthly_limit = %monthly_limit,
-        "monthly_usage_check"
-    );
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Unable to check usage",
+                        &request_id,
+                        start,
+                    ).await;
 
-    if monthly_calls >= monthly_limit as i64 {
+                    return;
+                }
+            };
+
+        info!(
+            user_id = %user_id,
+            plan = %plan,
+            lifetime_calls = %lifetime_calls,
+            limit = %limit,
+            "lifetime_usage_check"
+        );
+
+        if lifetime_calls >= limit as i64 {
+
+            let body = serde_json::json!({
+                "error": "trial_limit_reached",
+                "plan": "free",
+                "used": lifetime_calls,
+                "limit": limit
+            })
+            .to_string();
+
+            send_response(
+                &mut client,
+                "429 Too Many Requests",
+                &body,
+                &request_id,
+                start,
+            ).await;
+
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // PREMIUM PLAN
+    // ------------------------------------------------------------
+    // Premium gets a monthly limit.
+    // The counter resets automatically each month because
+    // get_monthly_ai_calls() only counts the current month.
+    // ------------------------------------------------------------
+
+    else if plan == "premium" {
+
+        let monthly_calls =
+            match db::get_monthly_ai_calls(
+                &db_client,
+                &user_id,
+            ).await {
+                Ok(count) => count,
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to get monthly AI calls: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Unable to check usage",
+                        &request_id,
+                        start,
+                    ).await;
+
+                    return;
+                }
+            };
+
+        info!(
+            user_id = %user_id,
+            plan = %plan,
+            monthly_calls = %monthly_calls,
+            limit = %limit,
+            "monthly_usage_check"
+        );
+
+        if monthly_calls >= limit as i64 {
+
+            let body = serde_json::json!({
+                "error": "monthly_limit_reached",
+                "plan": "premium",
+                "used": monthly_calls,
+                "limit": limit
+            })
+            .to_string();
+
+            send_response(
+                &mut client,
+                "429 Too Many Requests",
+                &body,
+                &request_id,
+                start,
+            ).await;
+
+            return;
+        }
+    }
+
+    // ------------------------------------------------------------
+    // MANUAL PLAN
+    // ------------------------------------------------------------
+    // Premium has expired.
+    // Manual transactions will be handled separately.
+    // For now, no AI access.
+    // ------------------------------------------------------------
+
+    else if plan == "manual" {
+
         let body = serde_json::json!({
-            "error": "monthly_limit_reached",
-            "plan": plan,
-            "used": monthly_calls,
-            "limit": monthly_limit
+            "error": "manual_plan",
+            "plan": "manual",
+            "message": "AI access is unavailable on the manual plan"
         })
         .to_string();
 
         send_response(
             &mut client,
-            "429 Too Many Requests",
+            "403 Forbidden",
             &body,
             &request_id,
             start,

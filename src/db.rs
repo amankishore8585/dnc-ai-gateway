@@ -134,7 +134,23 @@ pub async fn get_user_plan(
     let row = client
         .query_one(
             r#"
-            SELECT plan, monthly_limit
+            SELECT
+                CASE
+                    WHEN plan = 'premium'
+                         AND premium_expires_at IS NOT NULL
+                         AND premium_expires_at <= NOW()
+                    THEN 'manual'
+                    ELSE plan
+                END AS plan,
+
+                CASE
+                    WHEN plan = 'premium'
+                         AND premium_expires_at IS NOT NULL
+                         AND premium_expires_at <= NOW()
+                    THEN 0
+                    ELSE monthly_limit
+                END AS monthly_limit
+
             FROM users
             WHERE username = split_part($1, ':', 1)
               AND app_id = split_part($1, ':', 2)
@@ -160,6 +176,27 @@ pub async fn get_monthly_ai_calls(
             FROM usage_logs
             WHERE user_id = $1
               AND created_at >= date_trunc('month', NOW())
+              AND total_tokens > 0
+            "#,
+            &[&user_id],
+        )
+        .await?;
+
+    let count: i64 = row.get(0);
+
+    Ok(count)
+}
+
+pub async fn get_lifetime_ai_calls(
+    client: &Client,
+    user_id: &str,
+) -> Result<i64, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT COUNT(*)
+            FROM usage_logs
+            WHERE user_id = $1
               AND total_tokens > 0
             "#,
             &[&user_id],
