@@ -131,26 +131,39 @@ pub async fn get_user_plan(
     client: &Client,
     user_id: &str,
 ) -> Result<(String, i32), tokio_postgres::Error> {
+
+    // --------------------------------------------------
+    // If Premium has expired, permanently move user
+    // to the manual plan in the database.
+    // --------------------------------------------------
+
+    client
+        .execute(
+            r#"
+            UPDATE users
+            SET
+                plan = 'manual',
+                monthly_limit = 0
+            WHERE username = split_part($1, ':', 1)
+              AND app_id = split_part($1, ':', 2)
+              AND plan = 'premium'
+              AND premium_expires_at IS NOT NULL
+              AND premium_expires_at <= NOW()
+            "#,
+            &[&user_id],
+        )
+        .await?;
+
+    // --------------------------------------------------
+    // Get the actual current plan from the database.
+    // --------------------------------------------------
+
     let row = client
         .query_one(
             r#"
             SELECT
-                CASE
-                    WHEN plan = 'premium'
-                         AND premium_expires_at IS NOT NULL
-                         AND premium_expires_at <= NOW()
-                    THEN 'manual'
-                    ELSE plan
-                END AS plan,
-
-                CASE
-                    WHEN plan = 'premium'
-                         AND premium_expires_at IS NOT NULL
-                         AND premium_expires_at <= NOW()
-                    THEN 0
-                    ELSE monthly_limit
-                END AS monthly_limit
-
+                plan,
+                monthly_limit
             FROM users
             WHERE username = split_part($1, ':', 1)
               AND app_id = split_part($1, ':', 2)
@@ -175,7 +188,12 @@ pub async fn get_monthly_ai_calls(
             SELECT COUNT(*)
             FROM usage_logs
             WHERE user_id = $1
-              AND created_at >= date_trunc('month', NOW())
+              AND created_at >= (
+                  SELECT premium_started_at
+                  FROM users
+                  WHERE username = split_part($1, ':', 1)
+                    AND app_id = split_part($1, ':', 2)
+              )
               AND total_tokens > 0
             "#,
             &[&user_id],
@@ -265,6 +283,7 @@ pub async fn activate_premium(
             SET
                 plan = 'premium',
                 monthly_limit = 1000,
+                premium_started_at = NOW(),
                 premium_expires_at = NOW() + INTERVAL '30 days',
                 payment_type = 'one_time'
             WHERE username = $1
