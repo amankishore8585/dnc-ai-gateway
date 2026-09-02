@@ -93,9 +93,33 @@ pub async fn username_exists(
     Ok(row.get(0))
 }
 
+pub async fn email_exists(
+    client: &Client,
+    email: &str,
+    app_id: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM users
+                WHERE email = $1
+                  AND app_id = $2
+            )
+            "#,
+            &[&email, &app_id],
+        )
+        .await?;
+
+    Ok(row.get(0))
+}
+
 pub async fn create_user(
     client: &Client,
     username: &str,
+    email: &str,
+    password_hash: &str,
     app_id: &str,
 ) -> Result<(), tokio_postgres::Error> {
     client
@@ -103,6 +127,9 @@ pub async fn create_user(
             r#"
             INSERT INTO users (
                 username,
+                email,
+                password_hash,
+                email_verified,
                 app_id,
                 plan,
                 monthly_limit,
@@ -113,6 +140,9 @@ pub async fn create_user(
             VALUES (
                 $1,
                 $2,
+                $3,
+                FALSE,
+                $4,
                 'free',
                 100,
                 NULL,
@@ -120,7 +150,12 @@ pub async fn create_user(
                 NULL
             )
             "#,
-            &[&username, &app_id],
+            &[
+                &username,
+                &email,
+                &password_hash,
+                &app_id,
+            ],
         )
         .await?;
 

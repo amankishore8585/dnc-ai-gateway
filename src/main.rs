@@ -41,6 +41,8 @@ struct UserStats {
 #[derive(Deserialize)]
 struct RegisterUserRequest {
     username: String,
+    email: String,
+    password: String,
     app_id: String,
 }
 
@@ -97,7 +99,14 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> IoStream for T {}
 type Balancers = Arc<Mutex<HashMap<String, LoadBalancer>>>;
 
 
-
+use argon2::{
+    password_hash::{
+        rand_core::OsRng,
+        PasswordHasher,
+        SaltString,
+    },
+    Argon2,
+};
 
 
 // ------------------------------------------------------------
@@ -131,6 +140,26 @@ pub struct Request {
     path: String,
     version: String,
     headers: HashMap<String, String>,
+}
+
+fn hash_password(
+    password: &str,
+) -> Result<String, String> {
+    let salt = SaltString::generate(
+        &mut OsRng,
+    );
+
+    let argon2 = Argon2::default();
+
+    let password_hash = argon2
+        .hash_password(
+            password.as_bytes(),
+            &salt,
+        )
+        .map_err(|e| e.to_string())?
+        .to_string();
+
+    Ok(password_hash)
 }
 
 // ------------------------------------------------------------
@@ -722,6 +751,7 @@ async fn handle_client(
             .position(|w| w == b"\r\n\r\n")
         {
             Some(pos) => pos + 4,
+
             None => {
                 send_response(
                     &mut client,
@@ -784,13 +814,23 @@ async fn handle_client(
             };
 
         let username = payload.username.trim();
+        let email = payload.email.trim().to_lowercase();
+        let password = payload.password;
         let app_id = payload.app_id.trim();
 
-        if username.is_empty() || app_id.is_empty() {
+        // ------------------------------------------
+        // Validate required fields
+        // ------------------------------------------
+
+        if username.is_empty()
+            || email.is_empty()
+            || password.is_empty()
+            || app_id.is_empty()
+        {
             send_response(
                 &mut client,
                 "400 Bad Request",
-                "Username and app_id are required",
+                "Username, email, password and app_id are required",
                 &request_id,
                 start,
             )
@@ -798,6 +838,44 @@ async fn handle_client(
 
             return;
         }
+
+        // ------------------------------------------
+        // Basic email validation
+        // ------------------------------------------
+
+        if !email.contains('@') {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Invalid email address",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Password validation
+        // ------------------------------------------
+
+        if password.len() < 8 {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Password must be at least 8 characters",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Check username
+        // ------------------------------------------
 
         match db::username_exists(
             &db_client,
@@ -837,9 +915,81 @@ async fn handle_client(
             }
         }
 
+        // ------------------------------------------
+        // Check email
+        // ------------------------------------------
+
+        match db::email_exists(
+            &db_client,
+            &email,
+            app_id,
+        )
+        .await
+        {
+            Ok(true) => {
+                send_response(
+                    &mut client,
+                    "409 Conflict",
+                    "Email already registered",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Ok(false) => {}
+
+            Err(e) => {
+                eprintln!("Email check failed: {}", e);
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        }
+
+        // ------------------------------------------
+        // Hash password
+        // ------------------------------------------
+
+        let password_hash =
+            match hash_password(&password) {
+                Ok(hash) => hash,
+
+                Err(e) => {
+                    eprintln!("Password hashing failed: {}", e);
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Could not create account",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // ------------------------------------------
+        // Create user
+        // ------------------------------------------
+
         match db::create_user(
             &db_client,
             username,
+            &email,
+            &password_hash,
             app_id,
         )
         .await

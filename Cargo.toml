@@ -19,3 +19,5 @@ reqwest = { version = "0.12", features = ["json"] }
 dotenvy = "0.15"
 hmac = "0.12"
 hex = "0.4"
+argon2 = { version = "0.5", features = ["std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
