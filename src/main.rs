@@ -103,6 +103,7 @@ use argon2::{
     password_hash::{
         rand_core::OsRng,
         PasswordHasher,
+        PasswordVerifier,
         SaltString,
     },
     Argon2,
@@ -1023,6 +1024,279 @@ async fn handle_client(
             }
         }
     }
+
+    // ------------------------------------------------------------
+    // STEP 3.2: Handle user login
+    // ------------------------------------------------------------
+    if req.path == "/users/login" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid HTTP request",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let already_read = buffer.len() - header_end;
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+
+            let mut body = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body).await {
+                eprintln!("Failed to read login body: {}", e);
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid request body",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body);
+        }
+
+        let body = &buffer[header_end..header_end + content_length];
+
+        #[derive(Deserialize)]
+        struct LoginUserRequest {
+            identifier: String,
+            password: String,
+            app_id: String,
+        }
+
+        let payload =
+            match serde_json::from_slice::<LoginUserRequest>(body) {
+
+                Ok(payload) => payload,
+
+                Err(e) => {
+                    eprintln!("Invalid login JSON: {}", e);
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        "Invalid JSON",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let identifier = payload.identifier.trim().to_lowercase();
+        let password = payload.password;
+        let app_id = payload.app_id.trim();
+
+        // ------------------------------------------
+        // Validate fields
+        // ------------------------------------------
+
+        if identifier.is_empty()
+            || password.is_empty()
+            || app_id.is_empty()
+        {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Username/email, password and app_id are required",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Find user
+        // ------------------------------------------
+
+        let user = match db::get_user_for_login(
+            &db_client,
+            &identifier,
+            app_id,
+        )
+        .await
+        {
+            Ok(Some(user)) => user,
+
+            Ok(None) => {
+                send_response(
+                    &mut client,
+                    "401 Unauthorized",
+                    "Invalid username/email or password",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!("Login database error: {}", e);
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let (
+            username,
+            email,
+            password_hash,
+            _plan,
+            _monthly_limit,
+        ) = user;
+
+        // ------------------------------------------
+        // Verify password
+        // ------------------------------------------
+
+        let parsed_hash =
+            match argon2::PasswordHash::new(&password_hash) {
+
+                Ok(hash) => hash,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid stored password hash: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Authentication error",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let password_valid =
+            Argon2::default()
+                .verify_password(
+                    password.as_bytes(),
+                    &parsed_hash,
+                )
+                .is_ok();
+
+        if !password_valid {
+            send_response(
+                &mut client,
+                "401 Unauthorized",
+                "Invalid username/email or password",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Get current plan
+        // ------------------------------------------
+
+        let user_id = format!(
+            "{}:{}",
+            username,
+            app_id
+        );
+
+        let (plan, monthly_limit) =
+            match db::get_user_plan(
+                &db_client,
+                &user_id,
+            )
+            .await
+            {
+                Ok(result) => result,
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to get user plan after login: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Could not load account information",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // ------------------------------------------
+        // Successful login
+        // ------------------------------------------
+
+        let response_body = serde_json::json!({
+            "success": true,
+            "username": username,
+            "email": email,
+            "plan": plan,
+            "monthly_limit": monthly_limit
+        })
+        .to_string();
+
+        send_response(
+            &mut client,
+            "200 OK",
+            &response_body,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
 
     // ------------------------------------------------------------
     // Create Razorpay order

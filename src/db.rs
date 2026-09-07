@@ -162,6 +162,44 @@ pub async fn create_user(
     Ok(())
 }
 
+pub async fn get_user_for_login(
+    client: &Client,
+    identifier: &str,
+    app_id: &str,
+) -> Result<Option<(String, String, String, String, i32)>, tokio_postgres::Error> {
+
+    let row = client
+        .query_opt(
+            r#"
+            SELECT
+                username,
+                email,
+                password_hash,
+                plan,
+                monthly_limit
+            FROM users
+            WHERE app_id = $2
+              AND (
+                  username = $1
+                  OR email = $1
+              )
+            LIMIT 1
+            "#,
+            &[&identifier, &app_id],
+        )
+        .await?;
+
+    Ok(row.map(|r| {
+        (
+            r.get("username"),
+            r.get("email"),
+            r.get("password_hash"),
+            r.get("plan"),
+            r.get("monthly_limit"),
+        )
+    }))
+}
+
 pub async fn get_user_plan(
     client: &Client,
     user_id: &str,
