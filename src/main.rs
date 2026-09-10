@@ -2185,6 +2185,329 @@ async fn handle_client(
 
 
     // ------------------------------------------------------------
+    // Handle change password
+    // ------------------------------------------------------------
+    if req.path == "/users/change-password" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid HTTP request",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let already_read = buffer.len() - header_end;
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body_buf).await {
+                eprintln!(
+                    "Failed to read change password body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid request body",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body = &buffer[header_end..header_end + content_length];
+
+        #[derive(Deserialize)]
+        struct ChangePasswordRequest {
+            identifier: String,
+            current_password: String,
+            new_password: String,
+            app_id: String,
+        }
+
+        let payload =
+            match serde_json::from_slice::<ChangePasswordRequest>(body) {
+
+                Ok(payload) => payload,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid change password JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        "Invalid JSON",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let identifier = payload.identifier.trim().to_lowercase();
+        let current_password = payload.current_password;
+        let new_password = payload.new_password;
+        let app_id = payload.app_id.trim();
+
+        if identifier.is_empty()
+            || current_password.is_empty()
+            || new_password.is_empty()
+            || app_id.is_empty()
+        {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "All fields are required",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Password must be at least 8 characters
+        // --------------------------------------------------------
+
+        if new_password.chars().count() < 8 {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "New password must be at least 8 characters",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Find the user
+        // --------------------------------------------------------
+
+        let user = match db::get_user_for_login(
+            &db_client,
+            &identifier,
+            app_id,
+        )
+        .await
+        {
+            Ok(Some(user)) => user,
+
+            Ok(None) => {
+                send_response(
+                    &mut client,
+                    "401 Unauthorized",
+                    "Invalid username/email or password",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to find user for password change: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let (
+            user_id,
+            _username,
+            _email,
+            password_hash,
+            _plan,
+            _monthly_limit,
+            _email_verified,
+        ) = user;
+
+        // --------------------------------------------------------
+        // Verify current password
+        // --------------------------------------------------------
+
+        let parsed_hash =
+            match argon2::PasswordHash::new(&password_hash) {
+
+                Ok(hash) => hash,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid stored password hash: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Authentication error",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let password_valid =
+            Argon2::default()
+                .verify_password(
+                    current_password.as_bytes(),
+                    &parsed_hash,
+                )
+                .is_ok();
+
+        if !password_valid {
+            send_response(
+                &mut client,
+                "401 Unauthorized",
+                "Current password is incorrect",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        if !password_valid {
+            send_response(
+                &mut client,
+                "401 Unauthorized",
+                "Current password is incorrect",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Hash the new password
+        // --------------------------------------------------------
+
+        let new_password_hash = match hash_password(&new_password) {
+            Ok(hash) => hash,
+
+            Err(e) => {
+                eprintln!(
+                    "New password hashing failed: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Could not create new password",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // --------------------------------------------------------
+        // Update password
+        // --------------------------------------------------------
+
+        if let Err(e) = db::update_password_hash(
+            &db_client,
+            user_id,
+            &new_password_hash,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to update password for user {}: {}",
+                user_id,
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Could not change password",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        let response_body = serde_json::json!({
+            "success": true,
+            "message": "Password changed successfully"
+        })
+        .to_string();
+
+        send_response(
+            &mut client,
+            "200 OK",
+            &response_body,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
+
+    // ------------------------------------------------------------
     // STEP 3.2: Handle user login
     // ------------------------------------------------------------
     if req.path == "/users/login" && req.method == "POST" {
