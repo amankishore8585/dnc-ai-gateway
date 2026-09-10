@@ -215,6 +215,39 @@ pub async fn set_email_verified(
     Ok(())
 }
 
+pub async fn get_user_id_by_email(
+    client: &Client,
+    email: &str,
+    app_id: &str,
+) -> Result<Option<i32>, tokio_postgres::Error> {
+    client
+        .query_opt(
+            "SELECT id
+             FROM users
+             WHERE email = $1
+               AND app_id = $2
+             LIMIT 1",
+            &[&email, &app_id],
+        )
+        .await
+        .map(|row| row.map(|r| r.get::<_, i32>("id")))
+}
+
+pub async fn delete_email_verification(
+    client: &Client,
+    user_id: i32,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "DELETE FROM email_verifications
+             WHERE user_id = $1",
+            &[&user_id],
+        )
+        .await?;
+
+    Ok(())
+}
+
 pub async fn get_user_for_login(
     client: &Client,
     identifier: &str,

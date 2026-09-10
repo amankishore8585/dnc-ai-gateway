@@ -165,6 +165,49 @@ fn hash_password(
     Ok(password_hash)
 }
 
+async fn send_verification_email(
+    to: &str,
+    otp: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let api_key = env::var("RESEND_API_KEY")?;
+
+    let client = reqwest::Client::new();
+
+    let html = format!(
+        r#"
+        <h2>Money Assistant Email Verification</h2>
+        <p>Your verification code is:</p>
+        <h1>{}</h1>
+        <p>This code expires in 10 minutes.</p>
+        <p>If you did not create this account, you can ignore this email.</p>
+        "#,
+        otp
+    );
+
+    let response = client
+        .post("https://api.resend.com/emails")
+        .bearer_auth(api_key)
+        .json(&serde_json::json!({
+            "from": "onboarding@resend.dev",
+            "to": [to],
+            "subject": "Your Money Assistant verification code",
+            "html": html
+        }))
+        .send()
+        .await?;
+
+    let status = response.status();
+    let body = response.text().await?;
+
+    if !status.is_success() {
+        return Err(
+            format!("Resend error {}: {}", status, body).into()
+        );
+    }
+
+    Ok(())
+}
+
 // ------------------------------------------------------------
 // Basic HTTP request parser
 // ------------------------------------------------------------
@@ -1072,16 +1115,36 @@ async fn handle_client(
                 }
 
                 // ------------------------------------------
+                // Send verification email
+                // ------------------------------------------
+
+                if let Err(e) = send_verification_email(
+                    &email,
+                    &otp_string,
+                ).await
+                {
+                    eprintln!("Failed to send verification email: {}", e);
+
+                    send_response(
+                        &mut client,
+                        "502 Bad Gateway",
+                        "Could not send verification email",
+                        &request_id,
+                        start,
+                    ).await;
+
+                    return;
+                }
+
+                // ------------------------------------------
                 // Registration successful
-                // Email sending will be added next
                 // ------------------------------------------
 
                 let response_body = serde_json::json!({
                     "success": true,
-                    "message": "Verification code generated",
+                    "message": "Verification email sent",
                     "email": email
-                })
-                .to_string();
+                }).to_string();
 
                 send_response(
                     &mut client,
@@ -1089,8 +1152,7 @@ async fn handle_client(
                     &response_body,
                     &request_id,
                     start,
-                )
-                .await;
+                ).await;
 
                 return;
             }
@@ -1110,6 +1172,371 @@ async fn handle_client(
                 return;
             }
         }
+    }
+
+        
+    // ------------------------------------------------------------
+    // STEP 3.2: Handle email verification
+    // ------------------------------------------------------------
+    if req.path == "/users/verify-email" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid HTTP request",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let already_read = buffer.len() - header_end;
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body_buf).await {
+                eprintln!(
+                    "Failed to read email verification body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid request body",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body = &buffer[header_end..header_end + content_length];
+
+        #[derive(Deserialize)]
+        struct VerifyEmailRequest {
+            email: String,
+            otp: String,
+            app_id: String,
+        }
+
+        let payload =
+            match serde_json::from_slice::<VerifyEmailRequest>(body) {
+
+                Ok(payload) => payload,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid email verification JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        "Invalid JSON",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let email = payload.email.trim().to_lowercase();
+        let otp = payload.otp.trim();
+        let app_id = payload.app_id.trim();
+
+        // ------------------------------------------
+        // Validate fields
+        // ------------------------------------------
+
+        if email.is_empty()
+            || otp.is_empty()
+            || app_id.is_empty()
+        {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Email, OTP and app_id are required",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        if otp.len() != 6
+            || !otp.chars().all(|c| c.is_ascii_digit())
+        {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Invalid verification code",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Find user
+        // ------------------------------------------
+
+        let user_id = match db::get_user_id_by_email(
+            &db_client,
+            &email,
+            app_id,
+        )
+        .await
+        {
+            Ok(Some(user_id)) => user_id,
+
+            Ok(None) => {
+                send_response(
+                    &mut client,
+                    "404 Not Found",
+                    "User not found",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to find user for email verification: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // ------------------------------------------
+        // Get latest OTP
+        // ------------------------------------------
+
+        let verification = match db::get_email_verification(
+            &db_client,
+            user_id,
+        )
+        .await
+        {
+            Ok(Some(verification)) => verification,
+
+            Ok(None) => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "No verification code found",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to get verification code: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let (otp_hash, expires_at) = verification;
+
+        // ------------------------------------------
+        // Check OTP expiry
+        // ------------------------------------------
+
+        if chrono::Utc::now() > expires_at {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Verification code has expired",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Verify OTP
+        // ------------------------------------------
+
+        let parsed_hash =
+            match argon2::PasswordHash::new(&otp_hash) {
+
+                Ok(hash) => hash,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid stored OTP hash: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Verification error",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let otp_valid =
+            Argon2::default()
+                .verify_password(
+                    otp.as_bytes(),
+                    &parsed_hash,
+                )
+                .is_ok();
+
+        if !otp_valid {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Invalid verification code",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Mark email as verified
+        // ------------------------------------------
+
+        if let Err(e) = db::set_email_verified(
+            &db_client,
+            user_id,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to mark email as verified: {}",
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Could not verify email",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Consume verification code
+        // ------------------------------------------
+
+        if let Err(e) = db::delete_email_verification(
+            &db_client,
+            user_id,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to delete verification code: {}",
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Could not complete verification",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Verification successful
+        // ------------------------------------------
+
+        let response_body = serde_json::json!({
+            "success": true,
+            "message": "Email verified successfully"
+        })
+        .to_string();
+
+        send_response(
+            &mut client,
+            "200 OK",
+            &response_body,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
     }
 
     // ------------------------------------------------------------
@@ -2925,6 +3352,8 @@ async fn health_checker(balancers: Balancers) {
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+
     init_logging();
 
     let razorpay_key_id =
