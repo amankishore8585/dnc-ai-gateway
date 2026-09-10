@@ -109,6 +109,8 @@ use argon2::{
     Argon2,
 };
 
+use rand::Rng;
+
 
 // ------------------------------------------------------------
 // Model pricing (per 1K tokens)
@@ -995,11 +997,96 @@ async fn handle_client(
         )
         .await
         {
-            Ok(_) => {
+            Ok(user_id) => {
+
+                // ------------------------------------------
+                // Generate 6-digit email verification OTP
+                // ------------------------------------------
+
+                let otp = rand::thread_rng().gen_range(100000..=999999);
+                let otp_string = otp.to_string();
+
+                println!(
+                    "Generated email verification OTP for user {}: {}",
+                    user_id,
+                    otp_string
+                );
+
+                // ------------------------------------------
+                // Hash OTP before storing it
+                // ------------------------------------------
+
+                let otp_hash = match hash_password(&otp_string) {
+                    Ok(hash) => hash,
+
+                    Err(e) => {
+                        eprintln!("OTP hashing failed: {}", e);
+
+                        send_response(
+                            &mut client,
+                            "500 Internal Server Error",
+                            "Could not create verification code",
+                            &request_id,
+                            start,
+                        )
+                        .await;
+
+                        return;
+                    }
+                };
+
+                // ------------------------------------------
+                // OTP expires after 10 minutes
+                // ------------------------------------------
+
+                let expires_at =
+                    chrono::Utc::now() + chrono::Duration::minutes(10);
+
+                // ------------------------------------------
+                // Store OTP hash
+                // ------------------------------------------
+
+                if let Err(e) = db::create_email_verification(
+                    &db_client,
+                    user_id,
+                    &otp_hash,
+                    expires_at,
+                )
+                .await
+                {
+                    eprintln!(
+                        "Failed to store email verification OTP: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Could not create verification code",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+
+                // ------------------------------------------
+                // Registration successful
+                // Email sending will be added next
+                // ------------------------------------------
+
+                let response_body = serde_json::json!({
+                    "success": true,
+                    "message": "Verification code generated",
+                    "email": email
+                })
+                .to_string();
+
                 send_response(
                     &mut client,
                     "200 OK",
-                    "User registered",
+                    &response_body,
                     &request_id,
                     start,
                 )

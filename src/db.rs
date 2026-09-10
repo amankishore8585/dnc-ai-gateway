@@ -121,11 +121,10 @@ pub async fn create_user(
     email: &str,
     password_hash: &str,
     app_id: &str,
-) -> Result<(), tokio_postgres::Error> {
-    client
-        .execute(
-            r#"
-            INSERT INTO users (
+) -> Result<i32, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            "INSERT INTO users (
                 username,
                 email,
                 password_hash,
@@ -149,13 +148,67 @@ pub async fn create_user(
                 'free',
                 NULL
             )
-            "#,
-            &[
-                &username,
-                &email,
-                &password_hash,
-                &app_id,
-            ],
+            RETURNING id",
+            &[&username, &email, &password_hash, &app_id],
+        )
+        .await?;
+
+    let user_id: i32 = row.get("id");
+
+    Ok(user_id)
+}
+
+pub async fn create_email_verification(
+    client: &Client,
+    user_id: i32,
+    otp_hash: &str,
+    expires_at: chrono::DateTime<chrono::Utc>,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "INSERT INTO email_verifications (user_id, otp_hash, expires_at)
+             VALUES ($1, $2, $3)",
+            &[&user_id, &otp_hash, &expires_at],
+        )
+        .await?;
+
+    Ok(())
+}
+
+pub async fn get_email_verification(
+    client: &Client,
+    user_id: i32,
+) -> Result<Option<(String, chrono::DateTime<chrono::Utc>)>, tokio_postgres::Error> {
+    client
+        .query_opt(
+            "SELECT otp_hash, expires_at
+             FROM email_verifications
+             WHERE user_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1",
+            &[&user_id],
+        )
+        .await
+        .map(|row| {
+            row.map(|r| {
+                (
+                    r.get::<_, String>(0),
+                    r.get::<_, chrono::DateTime<chrono::Utc>>(1),
+                )
+            })
+        })
+}
+
+pub async fn set_email_verified(
+    client: &Client,
+    user_id: i32,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "UPDATE users
+             SET email_verified = TRUE
+             WHERE id = $1",
+            &[&user_id],
         )
         .await?;
 
