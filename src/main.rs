@@ -1697,6 +1697,7 @@ async fn handle_client(
             password_hash,
             _plan,
             _monthly_limit,
+            email_verified,
         ) = user;
 
         // ------------------------------------------
@@ -1740,6 +1741,23 @@ async fn handle_client(
                 &mut client,
                 "401 Unauthorized",
                 "Invalid username/email or password",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Check email verification
+        // ------------------------------------------
+
+        if !email_verified {
+            send_response(
+                &mut client,
+                "403 Forbidden",
+                "Email not verified",
                 &request_id,
                 start,
             )
@@ -1810,7 +1828,6 @@ async fn handle_client(
 
         return;
     }
-
 
     // ------------------------------------------------------------
     // Create Razorpay order

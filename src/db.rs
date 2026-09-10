@@ -252,7 +252,7 @@ pub async fn get_user_for_login(
     client: &Client,
     identifier: &str,
     app_id: &str,
-) -> Result<Option<(String, String, String, String, i32)>, tokio_postgres::Error> {
+) -> Result<Option<(String, String, String, String, i32, bool)>, tokio_postgres::Error> {
 
     let row = client
         .query_opt(
@@ -262,7 +262,8 @@ pub async fn get_user_for_login(
                 email,
                 password_hash,
                 plan,
-                monthly_limit
+                monthly_limit,
+                email_verified
             FROM users
             WHERE app_id = $2
               AND (
@@ -282,6 +283,7 @@ pub async fn get_user_for_login(
             r.get("password_hash"),
             r.get("plan"),
             r.get("monthly_limit"),
+            r.get("email_verified"),
         )
     }))
 }
