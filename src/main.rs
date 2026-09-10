@@ -208,6 +208,70 @@ async fn send_verification_email(
     Ok(())
 }
 
+async fn send_temporary_password_email(
+    email: &str,
+    username: &str,
+    temporary_password: &str,
+) -> Result<(), String> {
+
+    let api_key = match std::env::var("RESEND_API_KEY") {
+        Ok(key) => key,
+        Err(e) => {
+            return Err(format!(
+                "RESEND_API_KEY not found: {}",
+                e
+            ));
+        }
+    };
+
+    let client = reqwest::Client::new();
+
+    let body = format!(
+        "Hello {},\n\n\
+         We received a request to reset your Money Assistant password.\n\n\
+         Your temporary password is:\n\n\
+         {}\n\n\
+         You can use this temporary password to log in to Money Assistant.\n\n\
+         For security, please change your password after logging in.\n\n\
+         If you did not request a password reset, you can safely ignore this email.\n\n\
+         Regards,\n\
+         Money Assistant",
+        username,
+        temporary_password
+    );
+
+    let response = client
+        .post("https://api.resend.com/emails")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "from": "Money Assistant <onboarding@resend.dev>",
+            "to": [email],
+            "subject": "Your Money Assistant temporary password",
+            "text": body
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to contact Resend: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let response_body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+
+        return Err(format!(
+            "Resend returned {}: {}",
+            status,
+            response_body
+        ));
+    }
+
+    Ok(())
+}
+
+
 // ------------------------------------------------------------
 // Basic HTTP request parser
 // ------------------------------------------------------------
@@ -1829,6 +1893,275 @@ async fn handle_client(
             "success": true,
             "message": "Verification email sent",
             "email": email
+        })
+        .to_string();
+
+        send_response(
+            &mut client,
+            "200 OK",
+            &response_body,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
+    // ------------------------------------------------------------
+    // Handle forgot password
+    // ------------------------------------------------------------
+    if req.path == "/users/forgot-password" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid HTTP request",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let already_read = buffer.len() - header_end;
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body_buf).await {
+                eprintln!(
+                    "Failed to read forgot password body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid request body",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body = &buffer[header_end..header_end + content_length];
+
+        #[derive(Deserialize)]
+        struct ForgotPasswordRequest {
+            identifier: String,
+            app_id: String,
+        }
+
+        let payload =
+            match serde_json::from_slice::<ForgotPasswordRequest>(body) {
+
+                Ok(payload) => payload,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid forgot password JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        "Invalid JSON",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let identifier = payload.identifier.trim().to_lowercase();
+        let app_id = payload.app_id.trim();
+
+        if identifier.is_empty() || app_id.is_empty() {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Username or email is required",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // Find the user using username OR email
+        let user = match db::get_user_for_password_reset(
+            &db_client,
+            &identifier,
+            app_id,
+        )
+        .await
+        {
+            Ok(Some(user)) => user,
+
+            Ok(None) => {
+                send_response(
+                    &mut client,
+                    "404 Not Found",
+                    "User not found",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to find user for password reset: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let (user_id, username, email) = user;
+
+        // --------------------------------------------------------
+        // Generate a random 12-character temporary password
+        // --------------------------------------------------------
+
+        let temporary_password: String = {
+            let characters =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+            let mut rng = rand::thread_rng();
+
+            (0..12)
+                .map(|_| {
+                    let index = rng.gen_range(0..characters.len());
+                    characters[index] as char
+                })
+                .collect()
+        };
+
+        println!(
+            "Generated temporary password for user {}",
+            user_id
+        );
+
+        // Hash the temporary password before storing it
+        let password_hash = match hash_password(&temporary_password) {
+            Ok(hash) => hash,
+
+            Err(e) => {
+                eprintln!(
+                    "Temporary password hashing failed: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Could not create temporary password",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // Update the user's password
+        if let Err(e) = db::update_password_hash(
+            &db_client,
+            user_id,
+            &password_hash,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to update password for user {}: {}",
+                user_id,
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Could not reset password",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Send temporary password by email
+        // --------------------------------------------------------
+
+        if let Err(e) = send_temporary_password_email(
+            &email,
+            &username,
+            &temporary_password,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to send temporary password email: {}",
+                e
+            );
+
+            send_response(
+                &mut client,
+                "502 Bad Gateway",
+                "Could not send password reset email",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        let response_body = serde_json::json!({
+            "success": true,
+            "message": "Temporary password sent to your email"
         })
         .to_string();
 

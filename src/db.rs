@@ -494,3 +494,54 @@ pub async fn activate_premium(
 
     Ok(true)
 }
+
+pub async fn get_user_for_password_reset(
+    client: &Client,
+    identifier: &str,
+    app_id: &str,
+) -> Result<Option<(i32, String, String)>, tokio_postgres::Error> {
+    let row = client
+        .query_opt(
+            r#"
+            SELECT
+                id,
+                username,
+                email
+            FROM users
+            WHERE app_id = $2
+              AND (
+                  username = $1
+                  OR email = $1
+              )
+            LIMIT 1
+            "#,
+            &[&identifier, &app_id],
+        )
+        .await?;
+
+    Ok(row.map(|r| {
+        (
+            r.get("id"),
+            r.get("username"),
+            r.get("email"),
+        )
+    }))
+}
+
+
+pub async fn update_password_hash(
+    client: &Client,
+    user_id: i32,
+    password_hash: &str,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "UPDATE users
+             SET password_hash = $2
+             WHERE id = $1",
+            &[&user_id, &password_hash],
+        )
+        .await?;
+
+    Ok(())
+}
