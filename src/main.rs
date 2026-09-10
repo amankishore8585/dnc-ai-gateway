@@ -1692,6 +1692,7 @@ async fn handle_client(
         };
 
         let (
+            user_id,
             username,
             email,
             password_hash,
@@ -1754,6 +1755,110 @@ async fn handle_client(
         // ------------------------------------------
 
         if !email_verified {
+
+            // ------------------------------------------
+            // Generate fresh 6-digit verification OTP
+            // ------------------------------------------
+
+            let otp = rand::thread_rng().gen_range(100000..=999999);
+            let otp_string = otp.to_string();
+
+            println!(
+                "Generated login verification OTP for user {}: {}",
+                user_id,
+                otp_string
+            );
+
+            // ------------------------------------------
+            // Hash OTP before storing it
+            // ------------------------------------------
+
+            let otp_hash = match hash_password(&otp_string) {
+                Ok(hash) => hash,
+
+                Err(e) => {
+                    eprintln!("Login OTP hashing failed: {}", e);
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        "Could not create verification code",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+            // ------------------------------------------
+            // OTP expires after 10 minutes
+            // ------------------------------------------
+
+            let expires_at =
+                chrono::Utc::now() + chrono::Duration::minutes(10);
+
+            // ------------------------------------------
+            // Store OTP hash
+            // ------------------------------------------
+
+            if let Err(e) = db::create_email_verification(
+                &db_client,
+                user_id,
+                &otp_hash,
+                expires_at,
+            )
+            .await
+            {
+                eprintln!(
+                    "Failed to store login verification OTP: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Could not create verification code",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            // ------------------------------------------
+            // Send verification email
+            // ------------------------------------------
+
+            if let Err(e) = send_verification_email(
+                &email,
+                &otp_string,
+            )
+            .await
+            {
+                eprintln!(
+                    "Failed to send login verification email: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "502 Bad Gateway",
+                    "Could not send verification email",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            // ------------------------------------------
+            // Tell Flutter email is not verified
+            // ------------------------------------------
+
             let response_body = serde_json::json!({
                 "success": false,
                 "message": "Email not verified",

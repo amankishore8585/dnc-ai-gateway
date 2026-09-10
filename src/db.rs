@@ -252,12 +252,13 @@ pub async fn get_user_for_login(
     client: &Client,
     identifier: &str,
     app_id: &str,
-) -> Result<Option<(String, String, String, String, i32, bool)>, tokio_postgres::Error> {
+) -> Result<Option<(i32, String, String, String, String, i32, bool)>, tokio_postgres::Error> {
 
     let row = client
         .query_opt(
             r#"
             SELECT
+                id,
                 username,
                 email,
                 password_hash,
@@ -278,6 +279,7 @@ pub async fn get_user_for_login(
 
     Ok(row.map(|r| {
         (
+            r.get("id"),
             r.get("username"),
             r.get("email"),
             r.get("password_hash"),
