@@ -1540,6 +1540,312 @@ async fn handle_client(
     }
 
     // ------------------------------------------------------------
+    // Handle resend email verification
+    // ------------------------------------------------------------
+    if req.path == "/users/resend-verification" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid HTTP request",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let already_read = buffer.len() - header_end;
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body_buf).await {
+                eprintln!(
+                    "Failed to read resend verification body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    "Invalid request body",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body = &buffer[header_end..header_end + content_length];
+
+        #[derive(Deserialize)]
+        struct ResendVerificationRequest {
+            email: String,
+            app_id: String,
+        }
+
+        let payload =
+            match serde_json::from_slice::<ResendVerificationRequest>(body) {
+
+                Ok(payload) => payload,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid resend verification JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        "Invalid JSON",
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let email = payload.email.trim().to_lowercase();
+        let app_id = payload.app_id.trim();
+
+        // ------------------------------------------
+        // Validate fields
+        // ------------------------------------------
+
+        if email.is_empty() || app_id.is_empty() {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                "Email and app_id are required",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Find user
+        // ------------------------------------------
+
+        let user_id = match db::get_user_id_by_email(
+            &db_client,
+            &email,
+            app_id,
+        )
+        .await
+        {
+            Ok(Some(user_id)) => user_id,
+
+            Ok(None) => {
+                send_response(
+                    &mut client,
+                    "404 Not Found",
+                    "User not found",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to find user for resend verification: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Database error",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // ------------------------------------------
+        // Generate fresh 6-digit OTP
+        // ------------------------------------------
+
+        let otp = rand::thread_rng().gen_range(100000..=999999);
+        let otp_string = otp.to_string();
+
+        println!(
+            "Generated resend verification OTP for user {}: {}",
+            user_id,
+            otp_string
+        );
+
+        // ------------------------------------------
+        // Hash OTP
+        // ------------------------------------------
+
+        let otp_hash = match hash_password(&otp_string) {
+            Ok(hash) => hash,
+
+            Err(e) => {
+                eprintln!("Resend OTP hashing failed: {}", e);
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    "Could not create verification code",
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // ------------------------------------------
+        // OTP expires after 10 minutes
+        // ------------------------------------------
+
+        let expires_at =
+            chrono::Utc::now() + chrono::Duration::minutes(10);
+
+        // ------------------------------------------
+        // Delete previous verification codes
+        // ------------------------------------------
+
+        if let Err(e) = db::delete_email_verification(
+            &db_client,
+            user_id,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to delete previous verification code: {}",
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Could not create verification code",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Store new OTP
+        // ------------------------------------------
+
+        if let Err(e) = db::create_email_verification(
+            &db_client,
+            user_id,
+            &otp_hash,
+            expires_at,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to store resend verification OTP: {}",
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Could not create verification code",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Send verification email
+        // ------------------------------------------
+
+        if let Err(e) = send_verification_email(
+            &email,
+            &otp_string,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to send resend verification email: {}",
+                e
+            );
+
+            send_response(
+                &mut client,
+                "502 Bad Gateway",
+                "Could not send verification email",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------
+        // Resend successful
+        // ------------------------------------------
+
+        let response_body = serde_json::json!({
+            "success": true,
+            "message": "Verification email sent",
+            "email": email
+        })
+        .to_string();
+
+        send_response(
+            &mut client,
+            "200 OK",
+            &response_body,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
+
+    // ------------------------------------------------------------
     // STEP 3.2: Handle user login
     // ------------------------------------------------------------
     if req.path == "/users/login" && req.method == "POST" {
