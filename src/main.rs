@@ -2105,31 +2105,7 @@ async fn handle_client(
             }
         };
 
-        // Update the user's password
-        if let Err(e) = db::update_password_hash(
-            &db_client,
-            user_id,
-            &password_hash,
-        )
-        .await
-        {
-            eprintln!(
-                "Failed to update password for user {}: {}",
-                user_id,
-                e
-            );
-
-            send_response(
-                &mut client,
-                "500 Internal Server Error",
-                "Could not reset password",
-                &request_id,
-                start,
-            )
-            .await;
-
-            return;
-        }
+        
 
         // --------------------------------------------------------
         // Send temporary password by email
@@ -2151,6 +2127,36 @@ async fn handle_client(
                 &mut client,
                 "502 Bad Gateway",
                 "Could not send password reset email",
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Email was sent successfully.
+        // Now update the user's password.
+        // --------------------------------------------------------
+
+        if let Err(e) = db::update_password_hash(
+            &db_client,
+            user_id,
+            &password_hash,
+        )
+        .await
+        {
+            eprintln!(
+                "Failed to update password for user {}: {}",
+                user_id,
+                e
+            );
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                "Email sent, but could not reset password",
                 &request_id,
                 start,
             )
