@@ -1754,10 +1754,18 @@ async fn handle_client(
         // ------------------------------------------
 
         if !email_verified {
+            let response_body = serde_json::json!({
+                "success": false,
+                "message": "Email not verified",
+                "username": username,
+                "email": email
+            })
+            .to_string();
+
             send_response(
                 &mut client,
                 "403 Forbidden",
-                "Email not verified",
+                &response_body,
                 &request_id,
                 start,
             )
