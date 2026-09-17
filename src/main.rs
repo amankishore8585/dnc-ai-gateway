@@ -542,6 +542,65 @@ fn normalize_model(model: &str) -> String {
     }
 }
 
+// ------------------------------------------------------------
+// Razorpay webhook HMAC-SHA256 verification
+// ------------------------------------------------------------
+fn verify_razorpay_webhook_signature(
+    body: &[u8],
+    signature: &str,
+    secret: &str,
+) -> bool {
+    let mut key = secret.as_bytes().to_vec();
+
+    // HMAC-SHA256 block size = 64 bytes
+    if key.len() > 64 {
+        let mut hasher = Sha256::new();
+        hasher.update(&key);
+        key = hasher.finalize().to_vec();
+    }
+
+    key.resize(64, 0);
+
+    let mut o_key_pad = [0u8; 64];
+    let mut i_key_pad = [0u8; 64];
+
+    for i in 0..64 {
+        o_key_pad[i] = key[i] ^ 0x5c;
+        i_key_pad[i] = key[i] ^ 0x36;
+    }
+
+    // Inner hash
+    let mut inner = Sha256::new();
+    inner.update(i_key_pad);
+    inner.update(body);
+    let inner_hash = inner.finalize();
+
+    // Outer hash
+    let mut outer = Sha256::new();
+    outer.update(o_key_pad);
+    outer.update(inner_hash);
+    let result = outer.finalize();
+
+    let generated_signature: String =
+        result.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Constant-time comparison
+    if generated_signature.len() != signature.len() {
+        return false;
+    }
+
+    let mut diff = 0u8;
+
+    for (a, b) in generated_signature
+        .bytes()
+        .zip(signature.bytes())
+    {
+        diff |= a ^ b;
+    }
+
+    diff == 0
+}
+
 // ============================================================
 // MAIN REQUEST HANDLER (CORE LOGIC)
 // ------------------------------------------------------------
@@ -3397,6 +3456,253 @@ async fn handle_client(
 
         return;
     }
+
+    // ------------------------------------------------------------
+    // Razorpay Webhook
+    // ------------------------------------------------------------
+    if req.path == "/webhooks/razorpay" && req.method == "POST" {
+
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid HTTP request"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // Read any remaining body bytes
+        let already_read = buffer.len().saturating_sub(header_end);
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) = client.read_exact(&mut body_buf).await {
+                eprintln!(
+                    "Failed to read Razorpay webhook body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid request body"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body_end = header_end + content_length;
+
+        if body_end > buffer.len() {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                r#"{"error":"Incomplete request body"}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // IMPORTANT:
+        // Use the exact raw body for signature verification.
+        let webhook_body = &buffer[header_end..body_end];
+
+        let signature = match req.headers.get("X-Razorpay-Signature") {
+            Some(value) if !value.trim().is_empty() => value.trim(),
+
+            _ => {
+                eprintln!("Razorpay webhook missing signature");
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Missing webhook signature"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let webhook_secret =
+            match env::var("RAZORPAY_WEBHOOK_SECRET") {
+                Ok(secret) if !secret.is_empty() => secret,
+
+                _ => {
+                    eprintln!(
+                        "RAZORPAY_WEBHOOK_SECRET is not configured"
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        r#"{"error":"Webhook secret not configured"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Verify Razorpay signature
+        if !verify_razorpay_webhook_signature(
+            webhook_body,
+            signature,
+            &webhook_secret,
+        ) {
+            eprintln!("Invalid Razorpay webhook signature");
+
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                r#"{"error":"Invalid webhook signature"}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // Parse webhook JSON
+        let webhook: serde_json::Value =
+            match serde_json::from_slice(webhook_body) {
+                Ok(value) => value,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid Razorpay webhook JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Invalid JSON"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let event = webhook
+            .get("event")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let event_id = req
+            .headers
+            .get("x-razorpay-event-id")
+            .map(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        info!(
+            event = %event,
+            event_id = %event_id,
+            "razorpay_webhook_received"
+        );
+
+        // We only care about successful captured payments for now.
+        if event == "payment.captured" {
+
+            let payment = webhook
+                .get("payload")
+                .and_then(|v| v.get("payment"))
+                .and_then(|v| v.get("entity"));
+
+            if let Some(payment) = payment {
+
+                let payment_id = payment
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                let order_id = payment
+                    .get("order_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("none");
+
+                let amount = payment
+                    .get("amount")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+
+                let currency = payment
+                    .get("currency")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                let email = payment
+                    .get("email")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                let contact = payment
+                    .get("contact")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+
+                println!("========================================");
+                println!("RAZORPAY PAYMENT CAPTURED");
+                println!("Event ID: {}", event_id);
+                println!("Payment ID: {}", payment_id);
+                println!("Order ID: {}", order_id);
+                println!("Amount: {}", amount);
+                println!("Currency: {}", currency);
+                println!("Email: {}", email);
+                println!("Contact: {}", contact);
+                println!("========================================");
+            }
+        }
+
+        // Return 200 so Razorpay knows we received the webhook.
+        send_response(
+            &mut client,
+            "200 OK",
+            r#"{"success":true}"#,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
 
     // ---- STEP 4: API Key Authentication ----
 
