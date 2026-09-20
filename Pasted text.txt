@@ -1,109 +1,226 @@
-if let Ok(rows) = cached {
-            if !rows.is_empty() {
-                let cached_response: Vec<u8> = rows[0].get(0);
-                let _ = client.write_all(&cached_response).await;
+// We only care about successful captured payments for now.
+if event == "payment.captured" {
 
-                info!(
-                    request_id = %request_id,
-                    "cache_hit"
+    let payment = webhook
+        .get("payload")
+        .and_then(|v| v.get("payment"))
+        .and_then(|v| v.get("entity"));
+
+    if let Some(payment) = payment {
+
+        let payment_id = payment
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let order_id = payment
+            .get("order_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let amount = payment
+            .get("amount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let currency = payment
+            .get("currency")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let email = payment
+            .get("email")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+
+        let contact = payment
+            .get("contact")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        println!("========================================");
+        println!("RAZORPAY PAYMENT CAPTURED");
+        println!("Event ID: {}", event_id);
+        println!("Payment ID: {}", payment_id);
+        println!("Order ID: {}", order_id);
+        println!("Amount: {}", amount);
+        println!("Currency: {}", currency);
+        println!("Email: {}", email);
+        println!("Contact: {}", contact);
+        println!("========================================");
+
+        // ------------------------------------------------------------
+        // Check that this is the correct DNC Flow Premium payment
+        // ₹120 = 12000 paise
+        // ------------------------------------------------------------
+
+        if amount != 12000 || currency != "INR" {
+            eprintln!(
+                "Razorpay payment rejected: unexpected amount/currency: {} {}",
+                amount,
+                currency
+            );
+
+            send_response(
+                &mut client,
+                "200 OK",
+                r#"{"success":true}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // ------------------------------------------------------------
+        // Find the DNC Flow user by the email entered at checkout
+        // ------------------------------------------------------------
+
+        let username = match db::get_username_by_email(
+            &db_client,
+            &email,
+            "money_assistant",
+        )
+        .await
+        {
+            Ok(Some(username)) => username,
+
+            Ok(None) => {
+                eprintln!(
+                    "Razorpay payment received but no DNC Flow user found for email: {}",
+                    email
                 );
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to find DNC Flow user by email: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Database error"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        println!(
+            "Razorpay payment matched DNC Flow user: {}",
+            username
+        );
+
+        // ------------------------------------------------------------
+        // Prevent duplicate webhook/payment processing
+        // ------------------------------------------------------------
+
+        match db::payment_exists(&db_client, payment_id).await {
+            Ok(true) => {
+                println!(
+                    "Razorpay payment already processed: {}",
+                    payment_id
+                );
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Ok(false) => {}
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to check existing Razorpay payment: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Database error"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
 
                 return;
             }
         }
 
+        // ------------------------------------------------------------
+        // Activate DNC Flow Premium
+        // ------------------------------------------------------------
 
-
-     modified = headers;
-    }
-
-    let upstream_start = Instant::now();
-    // send request
-    upstream.write_all(&modified).await.unwrap();
-    upstream.flush().await.unwrap();
-
-    // 🔥 send any body bytes that were already read
-    let header_end = buffer.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-
-    if buffer.len() > header_end {
-        let already_read_body = &buffer[header_end..];
-        upstream.write_all(already_read_body).await.unwrap();
-    }
-
-    // ---- STEP 10: Read upstream response ----
-    // Handles:
-    // - chunked encoding
-    // - content-length fallback
-    
-    let content_length = req
-        .headers
-        .get("Content-Length")
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(0);
-
-    let already_read = buffer.len() - header_end;
-
-    let remaining = content_length.saturating_sub(already_read);
-
-    if remaining > 0 {
-        let mut remaining_buf = vec![0u8; remaining];
-
-        if let Err(e) = client.read_exact(&mut remaining_buf).await {
-            error!(request_id = %request_id, error = %e, "body_read_failed");
-        }
-        // ✅ IMPORTANT: add this line
-        buffer.extend_from_slice(&remaining_buf);
-
-        upstream.write_all(&remaining_buf).await.unwrap();
-    }
-
-    // ---- Generate FULL body + cache key (after full read) ----
-    if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
-        body_str = String::from_utf8_lossy(&buffer[pos + 4..]).to_string();
-    }
-
-    let normalized_prompt = extract_and_normalize_prompt(&body_str);
-    cache_key = generate_cache_key(&model, &normalized_prompt);
-
-    info!("should_parse: {}", should_parse);
-    info!("normalized_prompt: [{}]", normalized_prompt);
-    info!("model: {}", model);
-    info!("cache_key: {}", cache_key);
-
-    // ---- CACHE CHECK ----
-    if should_parse && !normalized_prompt.is_empty() && model != "unknown" {
-
-        let cached = db_client.query(
-            "SELECT response FROM prompt_cache 
-            WHERE cache_key = $1 
-            AND created_at > NOW() - INTERVAL '1 hour'",
-            &[&cache_key]
-        ).await;
-
-        if let Ok(rows) = cached {
-            if !rows.is_empty() {
-
-                let cached_response: Vec<u8> = rows[0].get(0);
-                let _ = client.write_all(&cached_response).await;
-
-                info!(
-                    request_id = %request_id,
-                    "cache_hit"
+        match db::activate_premium(
+            &db_client,
+            &username,
+            "money_assistant",
+            order_id,
+            payment_id,
+            amount as i32,
+            currency,
+        )
+        .await
+        {
+            Ok(true) => {
+                println!(
+                    "DNC Flow Premium activated for user: {}",
+                    username
                 );
+            }
+
+            Ok(false) => {
+                eprintln!(
+                    "Failed to activate Premium: user not found: {}",
+                    username
+                );
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to activate Premium for {}: {}",
+                    username,
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Database error"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
 
                 return;
             }
         }
     }
-
-    let mut prompt_tokens: u64 = 0;
-    let mut completion_tokens: u64 = 0;
-    let mut total_tokens: u64 = 0;
-
-
-
-
-
-
-
-AND created_at > NOW() - INTERVAL '1 hour'",
+}

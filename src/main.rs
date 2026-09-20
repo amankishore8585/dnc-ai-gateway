@@ -3457,6 +3457,46 @@ async fn handle_client(
         return;
     }
 
+    // ---- Get app update ----
+    if req.path == "/app/update" && req.method == "GET" {
+
+        match db::get_app_update(&db_client).await {
+
+            Ok(update) => {
+                let body =
+                    serde_json::to_string(&update)
+                        .unwrap();
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    &body,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to get app update: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Failed to get app update"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+        }
+
+        return;
+    }
+
     // ------------------------------------------------------------
     // Razorpay Webhook
     // ------------------------------------------------------------
@@ -3645,62 +3685,281 @@ async fn handle_client(
                 .and_then(|v| v.get("payment"))
                 .and_then(|v| v.get("entity"));
 
-            if let Some(payment) = payment {
+            let payment = match payment {
+                Some(payment) => payment,
 
-                let payment_id = payment
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                None => {
+                    eprintln!("Razorpay webhook missing payment entity");
 
-                let order_id = payment
-                    .get("order_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("none");
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Missing payment data"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
 
-                let amount = payment
-                    .get("amount")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                    return;
+                }
+            };
 
-                let currency = payment
-                    .get("currency")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+            // ------------------------------------------
+            // Extract payment information
+            // ------------------------------------------
 
-                let email = payment
-                    .get("email")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+            let payment_id = match payment
+                .get("id")
+                .and_then(|v| v.as_str())
+            {
+                Some(v) if !v.trim().is_empty() => v,
+                _ => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Missing payment ID"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
 
-                let contact = payment
-                    .get("contact")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
+                    return;
+                }
+            };
 
-                println!("========================================");
-                println!("RAZORPAY PAYMENT CAPTURED");
-                println!("Event ID: {}", event_id);
-                println!("Payment ID: {}", payment_id);
-                println!("Order ID: {}", order_id);
-                println!("Amount: {}", amount);
-                println!("Currency: {}", currency);
-                println!("Email: {}", email);
-                println!("Contact: {}", contact);
-                println!("========================================");
+            let order_id = payment
+                .get("order_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let amount = payment
+                .get("amount")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+
+            let currency = payment
+                .get("currency")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let email = payment
+                .get("email")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_lowercase();
+
+            println!("========================================");
+            println!("RAZORPAY PAYMENT CAPTURED");
+            println!("Event ID: {}", event_id);
+            println!("Payment ID: {}", payment_id);
+            println!("Order ID: {}", order_id);
+            println!("Amount: {}", amount);
+            println!("Currency: {}", currency);
+            println!("Email: {}", email);
+            println!("========================================");
+
+
+
+            // ------------------------------------------
+            // Find DNC Flow username using payment email
+            // ------------------------------------------
+
+            let username = match db::get_username_by_email(
+                &db_client,
+                &email,
+                "money_assistant",
+            )
+            .await
+            {
+                Ok(Some(username)) => username,
+
+                Ok(None) => {
+                    // Payment succeeded, but the email does not
+                    // belong to a DNC Flow account.
+                    eprintln!(
+                        "Razorpay payment received for unknown email: {}",
+                        email
+                    );
+
+                    // We acknowledge the webhook so Razorpay does
+                    // not keep retrying a payment that needs manual
+                    // resolution.
+                    send_response(
+                        &mut client,
+                        "200 OK",
+                        r#"{"success":true,"message":"Payment received; account not found"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to find username by payment email: {}",
+                        e
+                    );
+
+                    // Database failure = do NOT acknowledge.
+                    // Razorpay can retry the webhook.
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        r#"{"error":"Database error"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+
+            // ------------------------------------------
+            // Check whether this payment was already processed
+            // ------------------------------------------
+
+            match db::payment_exists(
+                &db_client,
+                payment_id,
+            )
+            .await
+            {
+                Ok(true) => {
+                    println!(
+                        "Payment already processed: {}",
+                        payment_id
+                    );
+
+                    // Already processed successfully.
+                    // Tell Razorpay we received it.
+                    send_response(
+                        &mut client,
+                        "200 OK",
+                        r#"{"success":true,"message":"Payment already processed"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+
+                Ok(false) => {}
+
+                Err(e) => {
+                    eprintln!(
+                        "Payment lookup failed: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        r#"{"error":"Database error"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+
+            // ------------------------------------------
+            // Activate Premium
+            // ------------------------------------------
+
+            match db::activate_premium(
+                &db_client,
+                &username,
+                "money_assistant",
+                order_id,
+                payment_id,
+                amount as i32,
+                currency,
+            )
+            .await
+            {
+                Ok(true) => {
+
+                    println!(
+                        "========================================"
+                    );
+                    println!(
+                        "PREMIUM ACTIVATED SUCCESSFULLY"
+                    );
+                    println!(
+                        "Username: {}",
+                        username
+                    );
+                    println!(
+                        "Email: {}",
+                        email
+                    );
+                    println!(
+                        "Payment ID: {}",
+                        payment_id
+                    );
+                    println!(
+                        "Order ID: {}",
+                        order_id
+                    );
+                    println!(
+                        "========================================"
+                    );
+
+                    send_response(
+                        &mut client,
+                        "200 OK",
+                        r#"{"success":true,"plan":"premium","monthly_limit":1000}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+                }
+
+                Ok(false) => {
+                    eprintln!(
+                        "Could not activate Premium: user not found: {}",
+                        username
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        r#"{"error":"Could not activate Premium"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+                }
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to activate Premium: {}",
+                        e
+                    );
+
+                    // Important: return non-2xx so Razorpay can retry.
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        r#"{"error":"Failed to activate Premium"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+                }
             }
+
+            return;
         }
-
-        // Return 200 so Razorpay knows we received the webhook.
-        send_response(
-            &mut client,
-            "200 OK",
-            r#"{"success":true}"#,
-            &request_id,
-            start,
-        )
-        .await;
-
-        return;
     }
 
 

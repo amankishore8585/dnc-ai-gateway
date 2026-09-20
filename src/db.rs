@@ -19,6 +19,50 @@ pub async fn connect_db() -> Client {
     client
 }
 
+#[derive(serde::Serialize)]
+pub struct AppUpdateRow {
+    pub latest_version_code: i32,
+    pub minimum_version_code: i32,
+    pub update_type: String,
+    pub title: String,
+    pub message: String,
+    pub button_text: String,
+    pub download_url: String,
+}
+
+
+pub async fn get_app_update(
+    client: &Client,
+) -> Result<AppUpdateRow, tokio_postgres::Error> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT
+                latest_version_code,
+                minimum_version_code,
+                update_type,
+                title,
+                message,
+                button_text,
+                download_url
+            FROM app_update
+            WHERE id = 1
+            "#,
+            &[],
+        )
+        .await?;
+
+    Ok(AppUpdateRow {
+        latest_version_code: row.get("latest_version_code"),
+        minimum_version_code: row.get("minimum_version_code"),
+        update_type: row.get("update_type"),
+        title: row.get("title"),
+        message: row.get("message"),
+        button_text: row.get("button_text"),
+        download_url: row.get("download_url"),
+    })
+}
+
 pub async fn insert_usage(
     client: &Client,
     user_id: &str,
@@ -232,6 +276,25 @@ pub async fn get_user_id_by_email(
         .await
         .map(|row| row.map(|r| r.get::<_, i32>("id")))
 }
+
+pub async fn get_username_by_email(
+    client: &Client,
+    email: &str,
+    app_id: &str,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    client
+        .query_opt(
+            "SELECT username
+             FROM users
+             WHERE email = $1
+               AND app_id = $2
+             LIMIT 1",
+            &[&email, &app_id],
+        )
+        .await
+        .map(|row| row.map(|r| r.get::<_, String>("username")))
+}
+
 
 pub async fn delete_email_verification(
     client: &Client,
