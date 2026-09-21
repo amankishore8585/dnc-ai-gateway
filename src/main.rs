@@ -175,11 +175,14 @@ async fn send_verification_email(
 
     let html = format!(
         r#"
-        <h2>Money Assistant Email Verification</h2>
+        <h2>DNC Flow Email Verification</h2>
         <p>Your verification code is:</p>
         <h1>{}</h1>
         <p>This code expires in 10 minutes.</p>
         <p>If you did not create this account, you can ignore this email.</p>
+        <br>
+        <p>Please do not reply to this email.</p>
+        <p>For support, contact <a href="mailto:dncsoftwarehelp@gmail.com">dncsoftwarehelp@gmail.com</a>.</p>
         "#,
         otp
     );
@@ -188,9 +191,9 @@ async fn send_verification_email(
         .post("https://api.resend.com/emails")
         .bearer_auth(api_key)
         .json(&serde_json::json!({
-            "from": "onboarding@resend.dev",
+            "from": "DNC Flow <noreply@dncflow.com>",
             "to": [to],
-            "subject": "Your Money Assistant verification code",
+            "subject": "Your Dnc FLow verification code",
             "html": html
         }))
         .send()
@@ -228,14 +231,16 @@ async fn send_temporary_password_email(
 
     let body = format!(
         "Hello {},\n\n\
-         We received a request to reset your Money Assistant password.\n\n\
+         We received a request to reset your DNC Flow password.\n\n\
          Your temporary password is:\n\n\
          {}\n\n\
-         You can use this temporary password to log in to Money Assistant.\n\n\
+         You can use this temporary password to log in to DNC Flow.\n\n\
          For security, please change your password after logging in.\n\n\
          If you did not request a password reset, you can safely ignore this email.\n\n\
+         Please do not reply to this email.\n\
+         For support, contact dncsoftwarehelp@gmail.com.\n\n\
          Regards,\n\
-         Money Assistant",
+         DNC Flow",
         username,
         temporary_password
     );
@@ -245,9 +250,9 @@ async fn send_temporary_password_email(
         .header("Authorization", format!("Bearer {}", api_key))
         .header("Content-Type", "application/json")
         .json(&serde_json::json!({
-            "from": "Money Assistant <onboarding@resend.dev>",
+            "from": "DNC Flow <noreply@dncflow.com>",
             "to": [email],
-            "subject": "Your Money Assistant temporary password",
+            "subject": "Your DNC Flow temporary password",
             "text": body
         }))
         .send()
