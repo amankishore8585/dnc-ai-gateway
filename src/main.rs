@@ -4286,7 +4286,11 @@ async fn handle_client(
     // - prompt not empty
     // - model successfully extracted
     
-    if should_parse && !normalized_prompt.is_empty() && model != "unknown" {
+    if should_parse
+        && !normalized_prompt.is_empty()
+        && model != "unknown"
+        && app_id != "money_assistant"
+    {
 
         let cached = db_client.query(
             "SELECT response FROM prompt_cache 
@@ -4862,7 +4866,11 @@ async fn handle_client(
         let _ = client.write_all(&response_buffer).await;
 
         // Step 16.---- CACHE STORE ----
-        if should_parse && !body_str.is_empty() && model != "unknown" {
+        if should_parse
+            && !body_str.is_empty()
+            && model != "unknown"
+            && app_id != "money_assistant"
+        {
 
             let db = db_client.clone();
             let cache_key_clone = cache_key.clone();
