@@ -639,6 +639,8 @@ async fn handle_client(
     db_client: Arc<tokio_postgres::Client>,
     razorpay_key_id: String,
     razorpay_key_secret: String,
+    google_service_account_email: String,
+    google_service_account_private_key: String,
 ) {
     use uuid::Uuid;
 
@@ -3380,6 +3382,518 @@ async fn handle_client(
     }
 
 
+    // ------------------------------------------------------------
+    // Verify Google Play purchase
+    // ------------------------------------------------------------
+    if req.path == "/payments/google-play/verify"
+        && req.method == "POST"
+    {
+        let user_id = match req.headers.get("X-User-Id") {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+
+            _ => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Missing X-User-Id"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let app_id = match req.headers.get("X-App-Id") {
+            Some(v) if !v.trim().is_empty() => v.trim().to_string(),
+
+            _ => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Missing X-App-Id"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        if app_id != "money_assistant" {
+            send_response(
+                &mut client,
+                "403 Forbidden",
+                r#"{"error":"Invalid app"}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // Read Content-Length
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        // Find end of HTTP headers
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid HTTP request"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // Read remaining body if necessary
+        let already_read =
+            buffer.len().saturating_sub(header_end);
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) =
+                client.read_exact(&mut body_buf).await
+            {
+                eprintln!(
+                    "Failed to read Google Play verification body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid request body"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body_bytes =
+            &buffer[header_end..header_end + content_length];
+
+        let body: serde_json::Value =
+            match serde_json::from_slice(body_bytes) {
+                Ok(v) => v,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid Google Play request JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Invalid JSON"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let purchase_token =
+            match body
+                .get("purchase_token")
+                .and_then(|v| v.as_str())
+            {
+                Some(v) if !v.trim().is_empty() => v.trim(),
+
+                _ => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Missing purchase_token"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // We only accept our Premium product.
+        let product_id = "premium_1000_scans";
+        let package_name = "com.dncflow.app";
+
+        // Check whether this Google purchase token was already processed.
+        match db::payment_exists(
+            &db_client,
+            purchase_token,
+        )
+        .await
+        {
+            Ok(true) => {
+                println!(
+                    "Google Play payment already activated, checking consumption: {}",
+                    purchase_token
+                );
+
+                // We already activated Premium in our DB.
+                // Now verify the Google purchase again so we can retry
+                // consumption if the previous consume attempt failed.
+
+                let google_client = reqwest::Client::new();
+
+                let access_token =
+                    match payments::get_google_access_token(
+                        &google_client,
+                        &google_service_account_email,
+                        &google_service_account_private_key,
+                    )
+                    .await
+                    {
+                        Ok(token) => token,
+
+                        Err(e) => {
+                            eprintln!(
+                                "Google OAuth failed while retrying consumption: {}",
+                                e
+                            );
+
+                            send_response(
+                                &mut client,
+                                "502 Bad Gateway",
+                                r#"{"error":"Google authentication failed"}"#,
+                                &request_id,
+                                start,
+                            )
+                            .await;
+
+                            return;
+                        }
+                    };
+
+                let purchase =
+                    match payments::verify_google_play_purchase(
+                        &google_client,
+                        &access_token,
+                        package_name,
+                        product_id,
+                        purchase_token,
+                    )
+                    .await
+                    {
+                        Ok(purchase) => purchase,
+
+                        Err(e) => {
+                            eprintln!(
+                                "Google Play verification failed while retrying consumption: {}",
+                                e
+                            );
+
+                            send_response(
+                                &mut client,
+                                "502 Bad Gateway",
+                                r#"{"error":"Google Play verification failed"}"#,
+                                &request_id,
+                                start,
+                            )
+                            .await;
+
+                            return;
+                        }
+                    };
+
+                let consumption_state =
+                    purchase
+                        .get("consumptionState")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(-1);
+
+                if consumption_state == 0 {
+                    if let Err(e) =
+                        payments::consume_google_play_purchase(
+                            &google_client,
+                            &access_token,
+                            package_name,
+                            product_id,
+                            purchase_token,
+                        )
+                        .await
+                    {
+                        eprintln!(
+                            "Google Play consumption retry failed: {}",
+                            e
+                        );
+
+                        send_response(
+                            &mut client,
+                            "502 Bad Gateway",
+                            r#"{"error":"Google Play consumption failed"}"#,
+                            &request_id,
+                            start,
+                        )
+                        .await;
+
+                        return;
+                    }
+
+                    println!(
+                        "Google Play purchase consumed successfully on retry: {}",
+                        purchase_token
+                    );
+                } else {
+                    println!(
+                        "Google Play purchase already consumed: {}",
+                        purchase_token
+                    );
+                }
+
+                // Premium was already activated in our DB.
+                // DO NOT call activate_premium() again.
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true,"plan":"premium","monthly_limit":1000}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            Ok(false) => {}
+
+            Err(e) => {
+                eprintln!(
+                    "Google Play payment lookup failed: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Database error"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        }
+
+        let google_client = reqwest::Client::new();
+
+        // Get Google Play API access token.
+        let access_token =
+            match payments::get_google_access_token(
+                &google_client,
+                &google_service_account_email,
+                &google_service_account_private_key,
+            )
+            .await
+            {
+                Ok(token) => token,
+
+                Err(e) => {
+                    eprintln!(
+                        "Google OAuth failed: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "502 Bad Gateway",
+                        &serde_json::json!({
+                            "error": "Google authentication failed"
+                        }).to_string(),
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Verify the purchase directly with Google Play.
+        let purchase =
+            match payments::verify_google_play_purchase(
+                &google_client,
+                &access_token,
+                package_name,
+                product_id,
+                purchase_token,
+            )
+            .await
+            {
+                Ok(purchase) => purchase,
+
+                Err(e) => {
+                    eprintln!(
+                        "Google Play purchase verification failed: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        &serde_json::json!({
+                            "error": "Invalid Google Play purchase"
+                        }).to_string(),
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Google Play legacy ProductPurchase:
+        // purchaseState = 0 means PURCHASED.
+        let purchase_state =
+            purchase
+                .get("purchaseState")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1);
+
+        if purchase_state != 0 {
+            send_response(
+                &mut client,
+                "400 Bad Request",
+                r#"{"error":"Google Play purchase is not completed"}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // Google gives us the real order ID.
+        let order_id =
+            match purchase
+                .get("orderId")
+                .and_then(|v| v.as_str())
+            {
+                Some(v) if !v.trim().is_empty() => v,
+
+                _ => {
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Google Play purchase missing order ID"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Activate Premium using the EXISTING entitlement mechanism.
+        match db::activate_premium(
+            &db_client,
+            &user_id,
+            "money_assistant",
+            order_id,
+            purchase_token,
+            12900,
+            "INR",
+        )
+        .await
+        {
+            Ok(true) => {
+
+                println!(
+                    "Google Play Premium activated: user={} order={}",
+                    user_id,
+                    order_id
+                );
+
+                // Consume only AFTER the database activation succeeded.
+                if let Err(e) =
+                    payments::consume_google_play_purchase(
+                        &google_client,
+                        &access_token,
+                        package_name,
+                        product_id,
+                        purchase_token,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "WARNING: Premium activated but Google Play consume failed: {}",
+                        e
+                    );
+                }
+
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true,"plan":"premium","monthly_limit":1000}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Ok(false) => {
+                send_response(
+                    &mut client,
+                    "404 Not Found",
+                    r#"{"error":"User not found"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+
+            Err(e) => {
+                eprintln!(
+                    "Failed to activate Google Play Premium: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Failed to activate Premium"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+            }
+        }
+
+        return;
+    }
+
+
 
     // ---- STEP 3.3: Get user plan ----
     if req.path == "/users/plan" && req.method == "GET" {
@@ -5040,6 +5554,14 @@ async fn main() {
         env::var("RAZORPAY_KEY_SECRET")
             .expect("RAZORPAY_KEY_SECRET not set");
 
+    let google_service_account_email =
+        env::var("GOOGLE_SERVICE_ACCOUNT_EMAIL")
+            .expect("GOOGLE_SERVICE_ACCOUNT_EMAIL not set");
+
+    let google_service_account_private_key =
+        env::var("GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY")
+            .expect("GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY not set");        
+
     let usage_map: UsageMap = Arc::new(Mutex::new(HashMap::new()));
 
     let api_keys = load_api_keys();
@@ -5103,6 +5625,12 @@ async fn main() {
 
                     let razorpay_key_id = razorpay_key_id.clone();
                     let razorpay_key_secret = razorpay_key_secret.clone();
+                    
+                    let google_service_account_email =
+                        google_service_account_email.clone();
+
+                    let google_service_account_private_key =
+                        google_service_account_private_key.clone();
 
                     async move {
                         handle_client(
@@ -5114,6 +5642,8 @@ async fn main() {
                             db_client,
                             razorpay_key_id,
                             razorpay_key_secret,
+                            google_service_account_email,
+                            google_service_account_private_key,
                         ).await;
                     }
                 });

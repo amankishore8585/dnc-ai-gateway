@@ -1,6 +1,8 @@
 use reqwest::Client;
 use serde_json::Value;
 use hmac::Mac;
+use serde::Serialize;
+use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 
 pub async fn create_order(
     client: &Client,
@@ -278,6 +280,149 @@ pub async fn verify_payment(
     //
     // Database activation will be handled by db.rs.
     // --------------------------------------------------------
+
+    Ok(())
+}
+
+///google play 
+#[derive(Serialize)]
+struct GoogleJwtClaims {
+    iss: String,
+    scope: String,
+    aud: String,
+    iat: usize,
+    exp: usize,
+}
+
+pub async fn get_google_access_token(
+    client: &Client,
+    service_account_email: &str,
+    private_key: &str,
+) -> Result<String, String> {
+    let now = chrono::Utc::now().timestamp() as usize;
+
+    let claims = GoogleJwtClaims {
+        iss: service_account_email.to_string(),
+        scope: "https://www.googleapis.com/auth/androidpublisher".to_string(),
+        aud: "https://oauth2.googleapis.com/token".to_string(),
+        iat: now,
+        exp: now + 3600,
+    };
+
+    let private_key = private_key.replace("\\n", "\n");
+
+    let encoding_key =
+        EncodingKey::from_rsa_pem(private_key.as_bytes())
+            .map_err(|e| format!("Invalid Google private key: {}", e))?;
+
+    let jwt = encode(
+        &Header::new(Algorithm::RS256),
+        &claims,
+        &encoding_key,
+    )
+    .map_err(|e| format!("Failed creating Google JWT: {}", e))?;
+
+    let response = client
+        .post("https://oauth2.googleapis.com/token")
+        .form(&[
+            (
+                "grant_type",
+                "urn:ietf:params:oauth:grant-type:jwt-bearer",
+            ),
+            ("assertion", jwt.as_str()),
+        ])
+        .send()
+        .await
+        .map_err(|e| format!("Google OAuth request failed: {}", e))?;
+
+    let status = response.status();
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed reading Google OAuth response: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("Google OAuth failed: {}", body));
+    }
+
+    let json: Value = serde_json::from_str(&body)
+        .map_err(|e| format!("Invalid Google OAuth response: {}", e))?;
+
+    json.get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .ok_or_else(|| "Google OAuth response missing access_token".to_string())
+}
+
+pub async fn verify_google_play_purchase(
+    client: &Client,
+    access_token: &str,
+    package_name: &str,
+    product_id: &str,
+    purchase_token: &str,
+) -> Result<Value, String> {
+    let url = format!(
+        "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{}/purchases/products/{}/tokens/{}",
+        package_name,
+        product_id,
+        purchase_token
+    );
+
+    let response = client
+        .get(url)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(|e| format!("Google Play verification request failed: {}", e))?;
+
+    let status = response.status();
+
+    let body = response
+        .text()
+        .await
+        .map_err(|e| format!("Failed reading Google Play response: {}", e))?;
+
+    if !status.is_success() {
+        return Err(format!("Google Play verification failed: {}", body));
+    }
+
+    serde_json::from_str(&body)
+        .map_err(|e| format!("Invalid Google Play purchase response: {}", e))
+}
+
+pub async fn consume_google_play_purchase(
+    client: &Client,
+    access_token: &str,
+    package_name: &str,
+    product_id: &str,
+    purchase_token: &str,
+) -> Result<(), String> {
+    let url = format!(
+        "https://androidpublisher.googleapis.com/androidpublisher/v3/applications/{}/purchases/products/{}/tokens/{}:consume",
+        package_name,
+        product_id,
+        purchase_token
+    );
+
+    let response = client
+        .post(url)
+        .bearer_auth(access_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .map_err(|e| format!("Google Play consume request failed: {}", e))?;
+
+    let status = response.status();
+
+    if !status.is_success() {
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "Unknown error".to_string());
+
+        return Err(format!("Google Play consume failed: {}", body));
+    }
 
     Ok(())
 }
