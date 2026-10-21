@@ -3545,6 +3545,30 @@ async fn handle_client(
         let product_id = "premium_1000_scans";
         let package_name = "com.dncflow.app";
 
+        // Save the purchase as pending before doing Google verification.
+        if let Err(e) = db::insert_google_play_pending_purchase(
+            &db_client,
+            &user_id,
+            purchase_token,
+            product_id,
+        )
+        .await
+        {
+            println!("Failed to save Google Play pending purchase: {}", e);
+
+            send_response(
+                &mut client,
+                "500 Internal Server Error",
+                r#"{"error":"Failed to save pending purchase"}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+
         // Check whether this Google purchase token was already processed.
         match db::payment_exists(
             &db_client,
@@ -3554,120 +3578,9 @@ async fn handle_client(
         {
             Ok(true) => {
                 println!(
-                    "Google Play payment already activated, checking consumption: {}",
+                    "Google Play payment already activated: {}",
                     purchase_token
                 );
-
-                // We already activated Premium in our DB.
-                // Now verify the Google purchase again so we can retry
-                // consumption if the previous consume attempt failed.
-
-                let google_client = reqwest::Client::new();
-
-                let access_token =
-                    match payments::get_google_access_token(
-                        &google_client,
-                        &google_service_account_email,
-                        &google_service_account_private_key,
-                    )
-                    .await
-                    {
-                        Ok(token) => token,
-
-                        Err(e) => {
-                            eprintln!(
-                                "Google OAuth failed while retrying consumption: {}",
-                                e
-                            );
-
-                            send_response(
-                                &mut client,
-                                "502 Bad Gateway",
-                                r#"{"error":"Google authentication failed"}"#,
-                                &request_id,
-                                start,
-                            )
-                            .await;
-
-                            return;
-                        }
-                    };
-
-                let purchase =
-                    match payments::verify_google_play_purchase(
-                        &google_client,
-                        &access_token,
-                        package_name,
-                        product_id,
-                        purchase_token,
-                    )
-                    .await
-                    {
-                        Ok(purchase) => purchase,
-
-                        Err(e) => {
-                            eprintln!(
-                                "Google Play verification failed while retrying consumption: {}",
-                                e
-                            );
-
-                            send_response(
-                                &mut client,
-                                "502 Bad Gateway",
-                                r#"{"error":"Google Play verification failed"}"#,
-                                &request_id,
-                                start,
-                            )
-                            .await;
-
-                            return;
-                        }
-                    };
-
-                let consumption_state =
-                    purchase
-                        .get("consumptionState")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(-1);
-
-                if consumption_state == 0 {
-                    if let Err(e) =
-                        payments::consume_google_play_purchase(
-                            &google_client,
-                            &access_token,
-                            package_name,
-                            product_id,
-                            purchase_token,
-                        )
-                        .await
-                    {
-                        eprintln!(
-                            "Google Play consumption retry failed: {}",
-                            e
-                        );
-
-                        send_response(
-                            &mut client,
-                            "502 Bad Gateway",
-                            r#"{"error":"Google Play consumption failed"}"#,
-                            &request_id,
-                            start,
-                        )
-                        .await;
-
-                        return;
-                    }
-
-                    println!(
-                        "Google Play purchase consumed successfully on retry: {}",
-                        purchase_token
-                    );
-                } else {
-                    println!(
-                        "Google Play purchase already consumed: {}",
-                        purchase_token
-                    );
-                }
 
                 // Premium was already activated in our DB.
                 // DO NOT call activate_premium() again.

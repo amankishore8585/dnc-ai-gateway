@@ -493,6 +493,27 @@ pub async fn payment_exists(
     Ok(row.get(0))
 }
 
+pub async fn insert_google_play_pending_purchase(
+    client: &tokio_postgres::Client,
+    user_id: &str,
+    purchase_token: &str,
+    product_id: &str,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            r#"
+            INSERT INTO google_play_pending_purchases
+                (user_id, purchase_token, product_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (purchase_token) DO NOTHING
+            "#,
+            &[&user_id, &purchase_token, &product_id],
+        )
+        .await?;
+
+    Ok(())
+}
+
 pub async fn activate_premium(
     client: &tokio_postgres::Client,
     user_id: &str,
