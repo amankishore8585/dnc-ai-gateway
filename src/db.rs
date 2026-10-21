@@ -514,6 +514,23 @@ pub async fn insert_google_play_pending_purchase(
     Ok(())
 }
 
+pub async fn delete_google_play_pending_purchase(
+    client: &tokio_postgres::Client,
+    purchase_token: &str,
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            r#"
+            DELETE FROM google_play_pending_purchases
+            WHERE purchase_token = $1
+            "#,
+            &[&purchase_token],
+        )
+        .await?;
+
+    Ok(())
+}
+
 pub async fn activate_premium(
     client: &tokio_postgres::Client,
     user_id: &str,

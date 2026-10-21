@@ -3748,6 +3748,18 @@ async fn handle_client(
                     order_id
                 );
 
+                if let Err(e) = db::delete_google_play_pending_purchase(
+                    &db_client,
+                    &purchase_token,
+                )
+                .await
+                {
+                    eprintln!(
+                        "WARNING: failed to delete Google Play pending purchase: {}",
+                        e
+                    );
+                }
+
                 // Consume only AFTER the database activation succeeded.
                 if let Err(e) =
                     payments::consume_google_play_purchase(
