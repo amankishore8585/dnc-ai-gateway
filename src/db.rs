@@ -665,3 +665,27 @@ pub async fn get_user_id_by_google_purchase_token(
 
     Ok(row.map(|r| r.get::<_, String>("user_id")))
 }
+
+pub async fn revoke_google_play_premium(
+    client: &Client,
+    user_id: &str,
+) -> Result<bool, tokio_postgres::Error> {
+    let updated = client
+        .execute(
+            r#"
+            UPDATE users
+            SET
+                plan = 'manual',
+                monthly_limit = 0,
+                premium_expires_at = NULL,
+                premium_started_at = NULL,
+                subscription_id = NULL
+            WHERE username = $1
+              AND app_id = 'money_assistant'
+            "#,
+            &[&user_id],
+        )
+        .await?;
+
+    Ok(updated > 0)
+}

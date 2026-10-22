@@ -4113,22 +4113,43 @@ async fn handle_client(
             );
 
             // Google has explicitly told us this purchase was voided.
-            if let Err(e) =
-                db::set_user_manual(
-                    &db_client,
-                    &user_id,
-                )
-                .await
+            let revoked = match db::revoke_google_play_premium(
+                &db_client,
+                &user_id,
+            )
+            .await
             {
+                Ok(value) => value,
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to revoke Google Play Premium: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "500 Internal Server Error",
+                        r#"{"error":"Failed to revoke Premium"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+            if !revoked {
                 eprintln!(
-                    "Failed to revoke Google Play Premium: {}",
-                    e
+                    "Google Play RTDN: no user row updated for user={}",
+                    user_id
                 );
 
                 send_response(
                     &mut client,
                     "500 Internal Server Error",
-                    r#"{"error":"Failed to revoke Premium"}"#,
+                    r#"{"error":"User was not updated"}"#,
                     &request_id,
                     start,
                 )
