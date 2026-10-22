@@ -646,3 +646,22 @@ pub async fn update_password_hash(
 
     Ok(())
 }
+
+pub async fn get_user_id_by_google_purchase_token(
+    client: &tokio_postgres::Client,
+    purchase_token: &str,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    let row = client
+        .query_opt(
+            r#"
+            SELECT user_id
+            FROM payments
+            WHERE razorpay_payment_id = $1
+            LIMIT 1
+            "#,
+            &[&purchase_token],
+        )
+        .await?;
+
+    Ok(row.map(|r| r.get::<_, String>("user_id")))
+}

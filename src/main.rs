@@ -3818,6 +3818,344 @@ async fn handle_client(
         return;
     }
 
+    // ------------------------------------------------------------
+    // Google Play RTDN
+    // ------------------------------------------------------------
+    if req.path == "/payments/google-play/rtdn"
+        && req.method == "POST"
+    {
+        // Read Content-Length
+        let content_length = req
+            .headers
+            .get("Content-Length")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+
+        // Find end of HTTP headers
+        let header_end = match buffer
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+        {
+            Some(pos) => pos + 4,
+
+            None => {
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid HTTP request"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        // Read remaining body if necessary
+        let already_read =
+            buffer.len().saturating_sub(header_end);
+
+        if already_read < content_length {
+            let remaining = content_length - already_read;
+            let mut body_buf = vec![0u8; remaining];
+
+            if let Err(e) =
+                client.read_exact(&mut body_buf).await
+            {
+                eprintln!(
+                    "Failed to read Google Play RTDN body: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "400 Bad Request",
+                    r#"{"error":"Invalid request body"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            buffer.extend_from_slice(&body_buf);
+        }
+
+        let body_bytes =
+            &buffer[header_end..header_end + content_length];
+
+        let body: serde_json::Value =
+            match serde_json::from_slice(body_bytes) {
+                Ok(v) => v,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid Google Play RTDN JSON: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Invalid JSON"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        // Pub/Sub puts the actual Google Play notification
+        // inside message.data as base64.
+        let encoded_data = match body
+            .get("message")
+            .and_then(|v| v.get("data"))
+            .and_then(|v| v.as_str())
+        {
+            Some(v) if !v.is_empty() => v,
+
+            _ => {
+                // Nothing useful to process.
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+        };
+
+        let decoded_data =
+            match base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                encoded_data,
+            ) {
+                Ok(v) => v,
+
+                Err(e) => {
+                    eprintln!(
+                        "Failed to decode Google Play RTDN data: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Invalid notification data"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        let notification: serde_json::Value =
+            match serde_json::from_slice(&decoded_data) {
+                Ok(v) => v,
+
+                Err(e) => {
+                    eprintln!(
+                        "Invalid Google Play RTDN notification: {}",
+                        e
+                    );
+
+                    send_response(
+                        &mut client,
+                        "400 Bad Request",
+                        r#"{"error":"Invalid notification"}"#,
+                        &request_id,
+                        start,
+                    )
+                    .await;
+
+                    return;
+                }
+            };
+
+        println!(
+            "Google Play RTDN received: {}",
+            notification
+        );
+
+        // Only process notifications for our app.
+        if notification
+            .get("packageName")
+            .and_then(|v| v.as_str())
+            != Some("com.dncflow.app")
+        {
+            send_response(
+                &mut client,
+                "200 OK",
+                r#"{"success":true}"#,
+                &request_id,
+                start,
+            )
+            .await;
+
+            return;
+        }
+
+        // --------------------------------------------------------
+        // Voided purchase = refund / chargeback / cancellation
+        // --------------------------------------------------------
+        if let Some(voided) =
+            notification.get("voidedPurchaseNotification")
+        {
+            let product_type =
+                voided
+                    .get("productType")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(-1);
+
+            // 2 = PRODUCT_TYPE_ONE_TIME
+            if product_type != 2 {
+                send_response(
+                    &mut client,
+                    "200 OK",
+                    r#"{"success":true}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            let purchase_token =
+                match voided
+                    .get("purchaseToken")
+                    .and_then(|v| v.as_str())
+                {
+                    Some(v) if !v.trim().is_empty() => v,
+
+                    _ => {
+                        eprintln!(
+                            "Google Play RTDN voided purchase missing token"
+                        );
+
+                        send_response(
+                            &mut client,
+                            "200 OK",
+                            r#"{"success":true}"#,
+                            &request_id,
+                            start,
+                        )
+                        .await;
+
+                        return;
+                    }
+                };
+
+            println!(
+                "Google Play voided purchase received: {}",
+                purchase_token
+            );
+
+            // Find which user originally bought this token.
+            let user_id =
+                match db::get_user_id_by_google_purchase_token(
+                    &db_client,
+                    purchase_token,
+                )
+                .await
+                {
+                    Ok(Some(user_id)) => user_id,
+
+                    Ok(None) => {
+                        eprintln!(
+                            "Google Play RTDN: no user found for purchase token"
+                        );
+
+                        send_response(
+                            &mut client,
+                            "200 OK",
+                            r#"{"success":true}"#,
+                            &request_id,
+                            start,
+                        )
+                        .await;
+
+                        return;
+                    }
+
+                    Err(e) => {
+                        eprintln!(
+                            "Google Play RTDN DB lookup failed: {}",
+                            e
+                        );
+
+                        send_response(
+                            &mut client,
+                            "500 Internal Server Error",
+                            r#"{"error":"Database error"}"#,
+                            &request_id,
+                            start,
+                        )
+                        .await;
+
+                        return;
+                    }
+                };
+
+            println!(
+                "Google Play RTDN: revoking Premium for user={}",
+                user_id
+            );
+
+            // Google has explicitly told us this purchase was voided.
+            if let Err(e) =
+                db::set_user_manual(
+                    &db_client,
+                    &user_id,
+                )
+                .await
+            {
+                eprintln!(
+                    "Failed to revoke Google Play Premium: {}",
+                    e
+                );
+
+                send_response(
+                    &mut client,
+                    "500 Internal Server Error",
+                    r#"{"error":"Failed to revoke Premium"}"#,
+                    &request_id,
+                    start,
+                )
+                .await;
+
+                return;
+            }
+
+            println!(
+                "Google Play Premium revoked: user={}",
+                user_id
+            );
+        }
+
+        // Always acknowledge the Pub/Sub message.
+        send_response(
+            &mut client,
+            "200 OK",
+            r#"{"success":true}"#,
+            &request_id,
+            start,
+        )
+        .await;
+
+        return;
+    }
+
 
 
     // ---- STEP 3.3: Get user plan ----
